@@ -54,7 +54,13 @@ const BUSINESS_TIMEZONE = 'Asia/Shanghai';
 const DEFAULT_DEADLINE = process.env.DEFAULT_DEADLINE || '22:00';
 
 const ADMIN_USERNAME = process.env.ADMIN_USERNAME || 'admin';
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'admin123';
+/**
+ * 管理员初始密码：
+ *  · 生产环境不内置任何默认密码，未配置 ADMIN_PASSWORD 时随机生成，
+ *    只在建号那一次打印到启动日志；
+ *  · 开发环境保留内置默认密码方便本地调试，但不会出现在页面/日志/文档里。
+ */
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || (IS_PROD ? '' : 'admin123');
 
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '')
   .split(',')
@@ -69,6 +75,15 @@ const NUDGE_COOLDOWN_MS = 10 * 60 * 1000; // 同一个好友 10 分钟内只能�
 
 if (IS_PROD && JWT_SECRET === 'dev-only-secret-please-change-me') {
   console.warn('[warn] 生产环境请务必设置 JWT_SECRET 环境变量！');
+}
+if (IS_PROD && !process.env.ADMIN_PASSWORD) {
+  console.warn('[warn] 生产环境未设置 ADMIN_PASSWORD，将随机生成管理员初始密码（只在建号时打印一次）');
+}
+if (!IS_PROD && !process.env.ADMIN_PASSWORD) {
+  console.warn(
+    '[warn] 正在使用开发环境默认管理员密码，仅限本地调试；' +
+      '部署到服务器请设置 ADMIN_PASSWORD 并加上 NODE_ENV=production'
+  );
 }
 
 /* --------------------------------------------------------------------------
@@ -259,6 +274,11 @@ const q = {
 
 const nowIso = () => new Date().toISOString();
 
+/** 生成随机初始密码（16 位 URL-safe） */
+function randomPassword() {
+  return crypto.randomBytes(12).toString('base64url');
+}
+
 function seed() {
   const defaults = {
     default_deadline: DEFAULT_DEADLINE,
@@ -271,8 +291,18 @@ function seed() {
 
   const existing = q.userByName.get(ADMIN_USERNAME);
   if (!existing) {
-    q.insertUser.run(ADMIN_USERNAME, hashPassword(ADMIN_PASSWORD), 1, nowIso(), nowIso());
-    console.log(`[seed] 已创建管理员账号：${ADMIN_USERNAME} / ${ADMIN_PASSWORD}`);
+    const generated = !ADMIN_PASSWORD;
+    const initialPassword = generated ? randomPassword() : ADMIN_PASSWORD;
+
+    q.insertUser.run(ADMIN_USERNAME, hashPassword(initialPassword), 1, nowIso(), nowIso());
+    console.log(`[seed] 已创建管理员账号：${ADMIN_USERNAME}`);
+
+    if (generated) {
+      console.log('[seed] 初始密码（仅打印这一次，登录后请立即修改）：');
+      console.log(`[seed]   ${initialPassword}`);
+    } else {
+      console.log('[seed] 初始密码来自 ADMIN_PASSWORD 环境变量（不在日志中显示）');
+    }
   } else if (existing.is_admin !== 1) {
     db.prepare('UPDATE users SET is_admin = 1 WHERE id = ?').run(existing.id);
   }
@@ -736,11 +766,11 @@ function freshUser(user) {
 /* ------------------------------- 健康检查 -------------------------------- */
 
 app.get('/api/health', (req, res) => {
+  // 公开探活接口不返回运行环境等内部信息
   res.json({
     ok: true,
     service: 'qiangzhi-checkin',
     version: '2.0.0',
-    env: NODE_ENV,
     timezone: BUSINESS_TIMEZONE,
     now: new Date().toISOString(),
     today: dateKey(),

@@ -18,12 +18,15 @@ module.exports = {
         PORT: 3000,
         HOST: '127.0.0.1', // 只监听本机，由 Nginx 对外
         DB_PATH: '/opt/qiangzhi/data/checkin.db',
-        JWT_SECRET: 'REPLACE_WITH_openssl_rand_hex_32',
+        // 不要把真实密钥提交到仓库：启动前 export，或改用 pm2 的 env 文件
+        //   export JWT_SECRET=$(openssl rand -hex 32)
+        JWT_SECRET: process.env.JWT_SECRET || 'CHANGE_ME_openssl_rand_hex_32',
         JWT_EXPIRES_IN: '7d',
         APP_TIMEZONE: 'Asia/Shanghai',
         DEFAULT_DEADLINE: '22:00',
         ADMIN_USERNAME: 'admin',
-        ADMIN_PASSWORD: 'admin123',
+        // 留空则首次建号时随机生成，并只打印一次
+        ADMIN_PASSWORD: process.env.ADMIN_PASSWORD || '',
         TRUST_PROXY: 'true',
       },
     },

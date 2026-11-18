@@ -6,6 +6,9 @@
  */
 
 const BASE = process.env.API_BASE || 'http://127.0.0.1:3000';
+// 管理员凭据从环境变量读取；本地开发默认值仅供测试使用
+const ADMIN_USERNAME = process.env.ADMIN_USERNAME || 'admin';
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'admin123';
 
 let passed = 0;
 let failed = 0;
@@ -78,9 +81,9 @@ async function main() {
   check('错误密码返回 401', badLogin.status === 401, badLogin);
 
   const adminLogin = await call('POST', '/api/login', {
-    body: { username: 'admin', password: 'admin123' },
+    body: { username: ADMIN_USERNAME, password: ADMIN_PASSWORD },
   });
-  check('内置管理员 admin/admin123 可登录', adminLogin.status === 200, adminLogin);
+  check('内置管理员可登录', adminLogin.status === 200, adminLogin);
   check('管理员标记 isAdmin', adminLogin.data && adminLogin.data.user.isAdmin === true, adminLogin.data);
 
   const alice = { token: regAlice.data.token };

@@ -662,7 +662,7 @@ function LoginScreen({ onLogin }) {
             />
           </NeonCard>
 
-          <Text style={styles.serverHint}>{API_BASE}</Text>
+          {__DEV__ ? <Text style={styles.serverHint}>{API_BASE}</Text> : null}
         </ScrollView>
       </KeyboardAvoidingView>
     </SafeAreaView>

@@ -139,4 +139,4 @@ if (wenyan && bird) {
 }
 
 db.close();
-console.log('\n完成。统一密码：demo1234；管理员：admin / admin123\n');
+console.log('\n完成。演示账号密码：demo1234（仅演示数据，不是管理员）\n');

@@ -8,6 +8,9 @@ import path from 'node:path';
 import Database from 'better-sqlite3';
 
 const BASE = process.env.API_BASE || 'http://127.0.0.1:3000';
+// 管理员凭据从环境变量读取；本地开发默认值仅供测试使用
+const ADMIN_USERNAME = process.env.ADMIN_USERNAME || 'admin';
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'admin123';
 const DB_PATH = process.env.DB_PATH || path.join(process.cwd(), 'data', 'checkin.db');
 
 let passed = 0;
@@ -68,9 +71,19 @@ async function main() {
   console.log(`\nv2 功能测试 -> ${BASE}\n今日（北京）：${today}\n`);
 
   const admin = await call('POST', '/api/login', {
-    body: { username: 'admin', password: 'admin123' },
+    body: { username: ADMIN_USERNAME, password: ADMIN_PASSWORD },
   });
   const adminToken = admin.data.token;
+
+  // 清掉上次残留的免打卡日，保证测试可重复执行
+  await call('POST', '/api/admin/set-skip-dates', {
+    token: adminToken,
+    body: { dates: [] },
+  });
+  await call('PUT', '/api/admin/settings', {
+    token: adminToken,
+    body: { defaultDeadline: '22:00' },
+  });
 
   const u1 = await register(`f1_${suffix}`);
   const u2 = await register(`f2_${suffix}`);

@@ -54,9 +54,14 @@ work2/
 ```bash
 cd server
 npm install
-npm start                # http://localhost:3000   admin / admin123
-npm run seed:demo        # 可选：塞 6 个演示用户（密码 demo1234）
+npm start                # http://localhost:3000
+npm run seed:demo        # 可选：塞 6 个演示用户（密码见脚本说明）
 ```
+
+> **管理员账号**：由 `ADMIN_USERNAME` / `ADMIN_PASSWORD` 环境变量决定。
+> 生产环境未设置密码时会随机生成，并只在首次建号的启动日志里打印一次；
+> 开发环境未设置时使用内置默认账号（仅限本地，请勿用于线上）。
+> 登录后请立即在「设置 → 账号」修改密码，或执行 `node scripts/reset-password.mjs admin 新密码`。
 
 Web：浏览器打开 <http://localhost:3000>。
 
@@ -82,6 +87,9 @@ npm start           # 终端 A
 npm run smoke       # 终端 B：43 条
 npm run test:v2     # 终端 B：52 条
 ```
+
+> 测试用 `ADMIN_USERNAME` / `ADMIN_PASSWORD` 登录管理员，默认取开发环境的本地账号；
+> 如果你已经改过管理员密码，运行时带上环境变量：`set ADMIN_PASSWORD=... && npm run smoke`。
 
 ---
 
