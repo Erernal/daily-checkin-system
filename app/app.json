@@ -1,0 +1,42 @@
+{
+  "expo": {
+    "name": "不拖延",
+    "slug": "qiangzhi-checkin",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "scheme": "qiangzhi",
+    "userInterfaceStyle": "dark",
+    "newArchEnabled": true,
+    "ios": {
+      "supportsTablet": false,
+      "bundleIdentifier": "com.example.qiangzhi"
+    },
+    "android": {
+      "package": "com.example.qiangzhi",
+      "permissions": [
+        "POST_NOTIFICATIONS",
+        "SCHEDULE_EXACT_ALARM",
+        "USE_EXACT_ALARM",
+        "VIBRATE",
+        "RECEIVE_BOOT_COMPLETED"
+      ]
+    },
+    "plugins": [
+      "expo-notifications",
+      [
+        "expo-build-properties",
+        {
+          "android": {
+            "usesCleartextTraffic": true
+          }
+        }
+      ]
+    ],
+    "extra": {
+      "apiBase": "http://localhost:3000",
+      "eas": {
+        "projectId": "b3b51823-e9e5-47d9-a7c0-0cea8e79c710"
+      }
+    }
+  }
+}

@@ -1,0 +1,996 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="theme-color" content="#0A0E17" />
+<title>不拖延 · 强制打卡系统</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⏰</text></svg>" />
+<style>
+  :root {
+    --bg: #0A0E17;
+    --bg-2: #0D1220;
+    --panel: #12161F;
+    --card: #1E1E24;
+    --line: rgba(0, 229, 255, .18);
+    --line-soft: rgba(255, 255, 255, .07);
+    --text: #EAF6FF;
+    --muted: #8A8A8A;
+    --cyan: #00E5FF;
+    --purple: #B388FF;
+    --green: #39FF88;
+    --yellow: #FFD166;
+    --red: #FF5C7A;
+    --mono: ui-monospace, SFMono-Regular, "JetBrains Mono", "Cascadia Code", Consolas, monospace;
+    --radius: 16px;
+  }
+
+  * { box-sizing: border-box; }
+  html, body { min-height: 100%; }
+  body {
+    margin: 0;
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    background:
+      radial-gradient(900px 520px at 12% -8%, rgba(0, 229, 255, .16), transparent 62%),
+      radial-gradient(760px 480px at 92% 4%, rgba(179, 136, 255, .14), transparent 60%),
+      var(--bg);
+    -webkit-font-smoothing: antialiased;
+  }
+  /* 网格底纹，营造赛博空间感 */
+  body::before {
+    content: '';
+    position: fixed; inset: 0; pointer-events: none; z-index: 0;
+    background-image:
+      linear-gradient(rgba(0, 229, 255, .035) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(0, 229, 255, .035) 1px, transparent 1px);
+    background-size: 52px 52px;
+    -webkit-mask-image: radial-gradient(circle at 50% 0%, #000 10%, transparent 78%);
+    mask-image: radial-gradient(circle at 50% 0%, #000 10%, transparent 78%);
+  }
+  .hidden { display: none !important; }
+  button, input, textarea, select { font: inherit; color: inherit; }
+  button { cursor: pointer; border: 0; background: none; }
+  a { color: var(--cyan); }
+
+  /* ---------------- 通用 ---------------- */
+  .card {
+    position: relative;
+    background: linear-gradient(180deg, rgba(30, 30, 36, .92), rgba(18, 22, 31, .94));
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    padding: 22px;
+    box-shadow:
+      0 0 26px rgba(0, 229, 255, .07),
+      inset 0 1px 0 rgba(255, 255, 255, .05);
+  }
+  .card::after {
+    content: '';
+    position: absolute; inset: 0; border-radius: inherit; pointer-events: none;
+    background: linear-gradient(140deg, rgba(0, 229, 255, .07), transparent 38%, transparent 62%, rgba(179, 136, 255, .07));
+  }
+  .card > * { position: relative; z-index: 1; }
+
+  .primary {
+    background: linear-gradient(135deg, var(--cyan), #5B8CFF 70%, var(--purple));
+    color: #04070E;
+    font-weight: 800;
+    letter-spacing: .04em;
+    padding: 13px 24px;
+    border-radius: 12px;
+    box-shadow: 0 0 18px rgba(0, 229, 255, .45), 0 10px 28px -14px rgba(0, 229, 255, .8);
+    transition: transform .12s ease, box-shadow .18s ease, filter .18s ease;
+  }
+  .primary:hover { filter: brightness(1.08); box-shadow: 0 0 26px rgba(0, 229, 255, .6); }
+  .primary:active { transform: scale(.98); }
+  .primary:disabled { opacity: .4; cursor: not-allowed; filter: grayscale(.4); box-shadow: none; }
+
+  .ghost {
+    background: rgba(0, 229, 255, .04);
+    border: 1px solid var(--line);
+    color: var(--text);
+    padding: 11px 18px;
+    border-radius: 12px;
+    transition: background .15s, box-shadow .15s, transform .12s;
+  }
+  .ghost:hover { background: rgba(0, 229, 255, .1); box-shadow: 0 0 16px rgba(0, 229, 255, .18); }
+  .ghost:active { transform: scale(.98); }
+
+  .danger-link {
+    color: var(--red);
+    border: 1px solid rgba(255, 92, 122, .35);
+    padding: 6px 12px;
+    border-radius: 9px;
+    font-size: 12px;
+    background: rgba(255, 92, 122, .06);
+    transition: background .15s;
+  }
+  .danger-link:hover { background: rgba(255, 92, 122, .16); }
+
+  label { display: block; font-size: 12px; color: var(--muted); letter-spacing: .08em; margin: 16px 0 7px; }
+  input[type="text"], input[type="password"], input[type="time"], textarea, select {
+    width: 100%;
+    background: rgba(10, 14, 23, .9);
+    border: 1px solid var(--line-soft);
+    border-radius: 11px;
+    padding: 12px 14px;
+    outline: none;
+    transition: border-color .15s, box-shadow .15s;
+  }
+  input:focus, textarea:focus, select:focus {
+    border-color: rgba(0, 229, 255, .7);
+    box-shadow: 0 0 0 3px rgba(0, 229, 255, .13), 0 0 18px rgba(0, 229, 255, .18);
+  }
+  textarea { resize: vertical; min-height: 86px; font-family: var(--mono); font-size: 13px; }
+  .row { display: flex; gap: 12px; flex-wrap: wrap; }
+  .row > * { flex: 1 1 170px; }
+  .hint { color: var(--muted); font-size: 13px; line-height: 1.7; }
+  .mono { font-family: var(--mono); }
+  .tag {
+    display: inline-block; font-family: var(--mono); font-size: 10px; letter-spacing: .16em;
+    color: var(--cyan); border: 1px solid var(--line); border-radius: 6px; padding: 3px 7px;
+    vertical-align: middle; margin-left: 8px;
+  }
+  .tag.purple { color: var(--purple); border-color: rgba(179, 136, 255, .35); }
+
+  /* ---------------- 登录 ---------------- */
+  #auth-view { position: relative; z-index: 1; min-height: 100vh; display: grid; place-items: center; padding: 24px; }
+  .auth-card { width: 100%; max-width: 430px; }
+  .auth-brand { display: flex; align-items: center; gap: 14px; }
+  .auth-brand .logo {
+    font-size: 34px;
+    filter: drop-shadow(0 0 12px rgba(0, 229, 255, .7));
+  }
+  .auth-brand h1 {
+    margin: 0; font-size: 26px; letter-spacing: .22em; font-weight: 800;
+    text-shadow: 0 0 22px rgba(0, 229, 255, .45);
+  }
+  .auth-brand p { margin: 5px 0 0; color: var(--muted); font-size: 12px; letter-spacing: .12em; }
+  .tabs { display: flex; gap: 6px; background: rgba(0, 229, 255, .05); border: 1px solid var(--line-soft); padding: 5px; border-radius: 12px; margin: 22px 0 4px; }
+  .tabs button { flex: 1; padding: 10px; border-radius: 9px; color: var(--muted); font-weight: 700; letter-spacing: .1em; font-size: 13px; }
+  .tabs button.active { background: rgba(0, 229, 255, .14); color: var(--cyan); box-shadow: inset 0 0 12px rgba(0, 229, 255, .18); }
+  .auth-card .primary { width: 100%; margin-top: 22px; padding: 14px; }
+  .auth-foot { text-align: center; color: var(--muted); font-size: 12px; margin-top: 18px; line-height: 1.9; }
+  .error-text { color: var(--red); font-size: 13px; min-height: 18px; margin-top: 12px; font-family: var(--mono); }
+
+  /* ---------------- 顶栏 ---------------- */
+  #app-view { position: relative; z-index: 1; }
+  .topbar {
+    display: flex; align-items: center; justify-content: space-between; gap: 16px;
+    padding: 16px clamp(16px, 4vw, 40px);
+    border-bottom: 1px solid var(--line-soft);
+    background: rgba(10, 14, 23, .82);
+    backdrop-filter: blur(14px);
+    position: sticky; top: 0; z-index: 20;
+  }
+  .brand { display: flex; align-items: center; gap: 12px; }
+  .brand .logo { font-size: 24px; filter: drop-shadow(0 0 10px rgba(0, 229, 255, .65)); }
+  .brand strong { display: block; font-size: 15px; letter-spacing: .2em; }
+  .brand small { color: var(--muted); font-size: 10px; letter-spacing: .28em; font-family: var(--mono); }
+  .userbox { display: flex; align-items: center; gap: 10px; }
+  .chip {
+    padding: 7px 13px; border-radius: 999px; font-size: 12px; font-family: var(--mono);
+    background: rgba(0, 229, 255, .06); border: 1px solid var(--line); color: var(--muted);
+  }
+  .chip b { color: var(--cyan); font-weight: 700; }
+
+  .nav { display: flex; gap: 8px; padding: 16px clamp(16px, 4vw, 40px) 0; overflow-x: auto; scrollbar-width: none; }
+  .nav::-webkit-scrollbar { display: none; }
+  .nav button {
+    padding: 10px 18px; border-radius: 10px; color: var(--muted);
+    border: 1px solid transparent; white-space: nowrap; font-weight: 700; letter-spacing: .1em; font-size: 13px;
+  }
+  .nav button.active { color: var(--cyan); background: rgba(0, 229, 255, .1); border-color: rgba(0, 229, 255, .4); box-shadow: 0 0 16px rgba(0, 229, 255, .18); }
+
+  main { padding: 22px clamp(16px, 4vw, 40px) 64px; max-width: 1120px; margin: 0 auto; }
+
+  /* ---------------- 打卡面板 ---------------- */
+  .banner {
+    display: flex; align-items: center; gap: 10px;
+    padding: 12px 16px; border-radius: 12px; margin-bottom: 16px;
+    border: 1px solid rgba(179, 136, 255, .45);
+    background: rgba(179, 136, 255, .09);
+    color: #D9C9FF; font-size: 13px;
+    box-shadow: 0 0 22px rgba(179, 136, 255, .16);
+  }
+  .hero { display: grid; grid-template-columns: 1.6fr 1fr; gap: 24px; align-items: center; }
+  .hero-label { color: var(--muted); font-size: 11px; letter-spacing: .28em; font-family: var(--mono); }
+  .pill {
+    display: inline-flex; align-items: center; gap: 8px;
+    margin: 12px 0 10px; padding: 9px 20px; border-radius: 999px;
+    font-size: 22px; font-weight: 800; letter-spacing: .06em;
+    background: rgba(255, 255, 255, .04); border: 1px solid var(--line-soft);
+  }
+  .pill.done { color: var(--green); border-color: rgba(57, 255, 136, .45); background: rgba(57, 255, 136, .09); box-shadow: 0 0 24px rgba(57, 255, 136, .18); }
+  .pill.late { color: var(--yellow); border-color: rgba(255, 209, 102, .45); background: rgba(255, 209, 102, .09); box-shadow: 0 0 24px rgba(255, 209, 102, .16); }
+  .pill.missed { color: var(--red); border-color: rgba(255, 92, 122, .45); background: rgba(255, 92, 122, .1); box-shadow: 0 0 24px rgba(255, 92, 122, .18); }
+  .pill.excused { color: var(--purple); border-color: rgba(179, 136, 255, .45); background: rgba(179, 136, 255, .1); }
+  .pill.holiday { color: var(--cyan); border-color: rgba(0, 229, 255, .5); background: rgba(0, 229, 255, .1); box-shadow: 0 0 24px rgba(0, 229, 255, .2); }
+  .pill.pending { color: var(--cyan); }
+  .countdown { font-variant-numeric: tabular-nums; font-size: 14px; color: var(--muted); margin-top: 6px; font-family: var(--mono); }
+  .countdown b { color: var(--text); font-size: 17px; }
+  .streak-box { text-align: center; border-left: 1px solid var(--line-soft); padding-left: 24px; }
+  .streak-num {
+    font-family: var(--mono); font-size: 66px; font-weight: 800; line-height: 1;
+    color: var(--cyan); text-shadow: 0 0 28px rgba(0, 229, 255, .55);
+  }
+  .streak-label { color: var(--muted); font-size: 11px; margin-top: 8px; letter-spacing: .22em; font-family: var(--mono); }
+  .streak-sub { color: var(--muted); font-size: 12px; margin-top: 12px; }
+  .streak-sub b { color: var(--text); font-family: var(--mono); }
+
+  .actions { display: flex; gap: 12px; flex-wrap: wrap; margin: 18px 0; }
+  .actions .primary { flex: 1 1 220px; padding: 16px; font-size: 15px; letter-spacing: .12em; }
+
+  .stats-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }
+  .stat { background: rgba(0, 229, 255, .03); border: 1px solid var(--line-soft); border-radius: 12px; padding: 16px; }
+  .stat .k { color: var(--muted); font-size: 11px; letter-spacing: .18em; font-family: var(--mono); }
+  .stat .v { font-size: 18px; font-weight: 700; margin-top: 6px; font-family: var(--mono); }
+
+  /* ---------------- 排行榜 ---------------- */
+  .section-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 4px 0 16px; flex-wrap: wrap; }
+  .section-head h2 { font-size: 16px; margin: 0; letter-spacing: .16em; }
+  .seg { display: inline-flex; background: rgba(0, 229, 255, .05); border: 1px solid var(--line-soft); border-radius: 10px; padding: 4px; gap: 4px; }
+  .seg button { padding: 7px 16px; border-radius: 7px; color: var(--muted); font-size: 12px; font-weight: 700; letter-spacing: .1em; }
+  .seg button.active { background: rgba(0, 229, 255, .14); color: var(--cyan); box-shadow: inset 0 0 10px rgba(0, 229, 255, .2); }
+  .table-wrap { overflow-x: auto; border-radius: var(--radius); border: 1px solid var(--line); background: linear-gradient(180deg, rgba(30, 30, 36, .92), rgba(18, 22, 31, .94)); }
+  table { width: 100%; border-collapse: collapse; min-width: 620px; }
+  th, td { padding: 14px 16px; text-align: left; border-bottom: 1px solid var(--line-soft); font-size: 14px; }
+  th { color: var(--muted); font-weight: 600; font-size: 11px; letter-spacing: .18em; font-family: var(--mono); background: rgba(0, 0, 0, .22); }
+  tbody tr:last-child td { border-bottom: 0; }
+  tbody tr { transition: background .15s; }
+  tbody tr:hover { background: rgba(0, 229, 255, .04); }
+  tbody tr.me { background: rgba(0, 229, 255, .07); }
+  tbody tr.me td:first-child { box-shadow: inset 3px 0 0 var(--cyan); }
+  .rank { font-family: var(--mono); font-weight: 700; color: var(--muted); }
+  .who { display: flex; align-items: center; gap: 10px; font-weight: 600; }
+  .avatar {
+    width: 30px; height: 30px; border-radius: 9px; display: grid; place-items: center;
+    font-size: 12px; font-weight: 800; color: #04070E;
+    background: linear-gradient(135deg, var(--cyan), var(--purple));
+    box-shadow: 0 0 14px rgba(0, 229, 255, .35);
+    flex: none;
+  }
+  .badge { display: inline-block; padding: 4px 10px; border-radius: 999px; font-size: 11px; border: 1px solid var(--line-soft); color: var(--muted); font-family: var(--mono); letter-spacing: .06em; }
+  .badge.done { color: var(--green); border-color: rgba(57, 255, 136, .4); background: rgba(57, 255, 136, .08); }
+  .badge.late { color: var(--yellow); border-color: rgba(255, 209, 102, .4); background: rgba(255, 209, 102, .08); }
+  .badge.missed { color: var(--red); border-color: rgba(255, 92, 122, .4); background: rgba(255, 92, 122, .08); }
+  .badge.excused { color: var(--purple); border-color: rgba(179, 136, 255, .4); background: rgba(179, 136, 255, .08); }
+  .badge.holiday { color: var(--cyan); border-color: rgba(0, 229, 255, .45); background: rgba(0, 229, 255, .08); }
+  .num { font-family: var(--mono); font-variant-numeric: tabular-nums; font-weight: 700; }
+  .num.big { font-size: 18px; color: var(--cyan); text-shadow: 0 0 14px rgba(0, 229, 255, .4); }
+  .empty { padding: 40px; text-align: center; color: var(--muted); font-family: var(--mono); font-size: 13px; }
+
+  /* ---------------- 设置 ---------------- */
+  .settings { display: grid; gap: 16px; }
+  .settings h2 { font-size: 15px; margin: 0 0 6px; letter-spacing: .14em; }
+  .settings .card p { margin: 0 0 4px; }
+  .save-row { display: flex; align-items: center; gap: 12px; margin-top: 18px; flex-wrap: wrap; }
+  .save-row .primary { padding: 11px 20px; font-size: 13px; }
+  .inline-hint { color: var(--muted); font-size: 12px; font-family: var(--mono); }
+  .skip-list { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+  .skip-chip {
+    font-family: var(--mono); font-size: 12px; padding: 5px 10px; border-radius: 7px;
+    color: var(--purple); border: 1px solid rgba(179, 136, 255, .35); background: rgba(179, 136, 255, .08);
+  }
+
+  /* ---------------- Toast ---------------- */
+  #toast {
+    position: fixed; left: 50%; bottom: 32px; transform: translate(-50%, 20px);
+    background: rgba(18, 22, 31, .96);
+    border: 1px solid rgba(0, 229, 255, .5);
+    color: var(--text);
+    padding: 13px 22px; border-radius: 12px; font-size: 13px;
+    box-shadow: 0 0 26px rgba(0, 229, 255, .28), 0 18px 40px -18px #000;
+    opacity: 0; pointer-events: none;
+    transition: opacity .2s, transform .2s; z-index: 100; max-width: min(92vw, 480px);
+  }
+  #toast.show { opacity: 1; transform: translate(-50%, 0); }
+  #toast.err { border-color: rgba(255, 92, 122, .6); box-shadow: 0 0 26px rgba(255, 92, 122, .3); }
+
+  @media (max-width: 780px) {
+    .hero { grid-template-columns: 1fr; }
+    .streak-box { border-left: 0; border-top: 1px solid var(--line-soft); padding: 20px 0 0; }
+    .streak-num { font-size: 54px; }
+    .stats-grid { grid-template-columns: 1fr; }
+    .brand small { display: none; }
+    th.best, td.best { display: none; }
+  }
+</style>
+</head>
+<body>
+
+<!-- ================= 登录 / 注册 ================= -->
+<div id="auth-view">
+  <div class="auth-card card">
+    <div class="auth-brand">
+      <span class="logo">⏰</span>
+      <div>
+        <h1>不拖延</h1>
+        <p>CHECK-IN OR EXCUSE · 强制打卡系统</p>
+      </div>
+    </div>
+
+    <div class="tabs">
+      <button id="tab-login" class="active" type="button">登录</button>
+      <button id="tab-register" type="button">注册</button>
+    </div>
+
+    <form id="auth-form" autocomplete="on">
+      <label for="auth-username">用户名</label>
+      <input id="auth-username" name="username" type="text" placeholder="2-24 位字母、数字或中文" autocomplete="username" required />
+
+      <label for="auth-password">密码</label>
+      <input id="auth-password" name="password" type="password" placeholder="至少 6 位" autocomplete="current-password" required />
+
+      <div id="auth-error" class="error-text"></div>
+      <button id="auth-submit" class="primary" type="submit">登 录</button>
+    </form>
+
+    <div class="auth-foot">
+      默认管理员：<b class="mono">admin / admin123</b><br />
+      所有时间以北京时间（Asia/Shanghai）为准
+    </div>
+  </div>
+</div>
+
+<!-- ================= 主应用 ================= -->
+<div id="app-view" class="hidden">
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">⏰</span>
+      <div>
+        <strong>不拖延</strong>
+        <small>NEVER PUT OFF</small>
+      </div>
+    </div>
+    <div class="userbox">
+      <span class="chip" id="user-chip">—</span>
+      <button class="ghost" id="logout-btn" type="button">退出</button>
+    </div>
+  </header>
+
+  <nav class="nav">
+    <button data-view="dashboard" class="active" type="button">今日打卡</button>
+    <button data-view="board" type="button">排行榜</button>
+    <button data-view="settings" type="button">设置</button>
+  </nav>
+
+  <main>
+    <!-- 打卡 -->
+    <section id="view-dashboard">
+      <div id="skip-banner" class="banner hidden">
+        <span>✦</span>
+        <span>今天是免打卡日，不用打卡也不会断签，连胜冻结。</span>
+      </div>
+
+      <div class="hero card">
+        <div>
+          <div class="hero-label">DAILY STATUS</div>
+          <div id="status-pill" class="pill">加载中…</div>
+          <div id="status-hint" class="hint">正在获取打卡状态</div>
+          <div id="countdown" class="countdown"></div>
+        </div>
+        <div class="streak-box">
+          <div id="streak-num" class="streak-num">0</div>
+          <div class="streak-label">CURRENT STREAK</div>
+          <div class="streak-sub">最佳 <b id="best-num">0</b> 天 · 累计 <b id="total-num">0</b> 次</div>
+        </div>
+      </div>
+
+      <div class="actions">
+        <button id="checkin-btn" class="primary" type="button">立即打卡</button>
+        <button id="excuse-toggle" class="ghost" type="button">我需要请假</button>
+      </div>
+
+      <form id="excuse-form" class="card hidden">
+        <h2 style="margin:0 0 6px;font-size:15px;letter-spacing:.14em">填写借口</h2>
+        <p class="hint">提交后今天记为“已请假”，连胜不加也不清零。下次别再这样了。</p>
+        <label for="excuse-reason">借口说明（2-300 字）</label>
+        <textarea id="excuse-reason" maxlength="300" placeholder="例如：加班到凌晨，实在赶不上 22:00 的截止时间……"></textarea>
+        <div class="save-row">
+          <button class="primary" type="submit">提交借口</button>
+          <button class="ghost" type="button" id="excuse-cancel">取消</button>
+        </div>
+      </form>
+
+      <div class="stats-grid" style="margin-top:16px">
+        <div class="stat"><div class="k">DEADLINE</div><div class="v" id="stat-deadline">--:--</div></div>
+        <div class="stat"><div class="k">TODAY (UTC+8)</div><div class="v" id="stat-today">----</div></div>
+        <div class="stat"><div class="k">TIMEZONE</div><div class="v" style="font-size:14px" id="stat-tz">Asia/Shanghai</div></div>
+      </div>
+    </section>
+
+    <!-- 排行榜 -->
+    <section id="view-board" class="hidden">
+      <div class="section-head">
+        <h2>排行榜 <span class="tag purple">LEADERBOARD</span></h2>
+        <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+          <div class="seg" id="period-tabs">
+            <button data-period="all" class="active" type="button">总榜</button>
+            <button data-period="week" type="button">周榜</button>
+            <button data-period="month" type="button">月榜</button>
+          </div>
+          <button class="ghost" id="board-refresh" type="button">刷新</button>
+        </div>
+      </div>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th style="width:66px">排名</th>
+              <th>用户</th>
+              <th style="width:104px" id="score-head">连续</th>
+              <th class="best" style="width:86px">最佳</th>
+              <th style="width:110px">今日</th>
+              <th class="admin-col hidden" style="width:92px">操作</th>
+            </tr>
+          </thead>
+          <tbody id="board-body">
+            <tr><td colspan="6" class="empty">加载中…</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="hint" style="margin-top:12px" id="board-meta"></p>
+    </section>
+
+    <!-- 设置 -->
+    <section id="view-settings" class="hidden">
+      <div class="settings">
+        <div class="card">
+          <h2>每日打卡时间</h2>
+          <p class="hint">到点仍未打卡，手机会弹系统强提醒；打开 App 会被全屏遮罩拦下，必须填借口。</p>
+          <form id="deadline-form">
+            <div class="row">
+              <div>
+                <label for="deadline-input">我的截止时间（北京时间）</label>
+                <input id="deadline-input" type="time" required />
+              </div>
+              <div style="display:flex;align-items:flex-end;gap:10px;padding-bottom:2px">
+                <button class="primary" type="submit">保存</button>
+                <button class="ghost" type="button" id="deadline-default">跟随全局</button>
+              </div>
+            </div>
+            <p class="inline-hint" id="deadline-hint" style="margin-top:12px"></p>
+          </form>
+        </div>
+
+        <div class="card">
+          <h2>免打卡日 <span class="tag">HOLIDAY</span></h2>
+          <p class="hint">免打卡日当天不打卡也不会断签，连胜冻结。以下为管理员设置的日期：</p>
+          <div class="skip-list" id="skip-list"><span class="inline-hint">暂无</span></div>
+        </div>
+
+        <div class="card">
+          <h2>账号</h2>
+          <p class="hint">修改后 Web 与 App 都使用新账号登录。</p>
+          <form id="account-form">
+            <div class="row">
+              <div>
+                <label for="account-username">用户名</label>
+                <input id="account-username" type="text" autocomplete="username" />
+              </div>
+              <div>
+                <label for="account-current">当前密码</label>
+                <input id="account-current" type="password" autocomplete="current-password" placeholder="修改时必填" />
+              </div>
+            </div>
+            <label for="account-password">新密码</label>
+            <input id="account-password" type="password" autocomplete="new-password" placeholder="留空表示不修改" />
+            <div class="save-row">
+              <button class="primary" type="submit">保存修改</button>
+              <span class="inline-hint">修改密码必须填写当前密码</span>
+            </div>
+          </form>
+        </div>
+
+        <div class="card admin-only hidden">
+          <h2>系统设置 <span class="tag purple">ADMIN ONLY</span></h2>
+          <p class="hint">对没有单独设置截止时间的用户生效；免打卡日对所有人生效。</p>
+          <form id="admin-form">
+            <div class="row">
+              <div>
+                <label for="admin-deadline">默认截止时间（北京时间）</label>
+                <input id="admin-deadline" type="time" />
+              </div>
+              <div>
+                <label>时区</label>
+                <input type="text" value="Asia/Shanghai（强制）" disabled />
+              </div>
+            </div>
+            <label for="admin-skip">免打卡日（YYYY-MM-DD，逗号或换行分隔）</label>
+            <textarea id="admin-skip" rows="3" placeholder="2026-12-25, 2027-01-01"></textarea>
+            <div class="save-row">
+              <button class="primary" type="submit">保存系统设置</button>
+              <span class="inline-hint" id="admin-skip-hint"></span>
+            </div>
+          </form>
+        </div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<div id="toast"></div>
+
+<script>
+(function () {
+  'use strict';
+
+  var TOKEN_KEY = 'qiangzhi.token';
+  var state = {
+    token: localStorage.getItem(TOKEN_KEY) || '',
+    user: null,
+    status: null,
+    view: 'dashboard',
+    authMode: 'login',
+    period: 'all',
+    deadlineAt: null,
+    timer: null
+  };
+
+  var $ = function (id) { return document.getElementById(id); };
+
+  function esc(value) {
+    return String(value == null ? '' : value).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+  }
+
+  var toastTimer = null;
+  function toast(message, isError) {
+    var el = $('toast');
+    el.textContent = message;
+    el.className = 'show' + (isError ? ' err' : '');
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(function () { el.className = ''; }, 3200);
+  }
+
+  function api(path, options) {
+    options = options || {};
+    var headers = { 'Content-Type': 'application/json' };
+    if (state.token) headers.Authorization = 'Bearer ' + state.token;
+
+    return fetch(path, {
+      method: options.method || 'GET',
+      headers: headers,
+      body: options.body === undefined ? undefined : JSON.stringify(options.body)
+    }).then(function (res) {
+      return res.json().catch(function () { return {}; }).then(function (data) {
+        if (res.status === 401 && state.token) {
+          signOut(true);
+          throw new Error('登录已过期，请重新登录');
+        }
+        if (!res.ok) {
+          var err = new Error((data && data.message) || ('请求失败 ' + res.status));
+          err.status = res.status;
+          err.code = data && data.error;
+          throw err;
+        }
+        return data;
+      });
+    });
+  }
+
+  var STATUS_TEXT = {
+    pending: '等待打卡',
+    done: '今日已打卡',
+    late: '迟到打卡',
+    excused: '已请假',
+    missed: '已漏签',
+    holiday: '免打卡日'
+  };
+
+  var STATUS_BADGE = {
+    pending: '待打卡',
+    done: '已打卡',
+    late: '迟到',
+    excused: '已请假',
+    missed: '漏签',
+    holiday: '免打卡'
+  };
+
+  /* ===================== 登录 / 注册 ===================== */
+
+  function setAuthMode(mode) {
+    state.authMode = mode;
+    $('tab-login').classList.toggle('active', mode === 'login');
+    $('tab-register').classList.toggle('active', mode === 'register');
+    $('auth-submit').textContent = mode === 'login' ? '登 录' : '注册并登录';
+    $('auth-error').textContent = '';
+  }
+
+  $('tab-login').addEventListener('click', function () { setAuthMode('login'); });
+  $('tab-register').addEventListener('click', function () { setAuthMode('register'); });
+
+  $('auth-form').addEventListener('submit', function (event) {
+    event.preventDefault();
+    var username = $('auth-username').value.trim();
+    var password = $('auth-password').value;
+    var error = $('auth-error');
+    var button = $('auth-submit');
+
+    error.textContent = '';
+    if (!username || !password) {
+      error.textContent = '请填写用户名和密码';
+      return;
+    }
+
+    button.disabled = true;
+    var path = state.authMode === 'login' ? '/api/login' : '/api/register';
+
+    api(path, { method: 'POST', body: { username: username, password: password } })
+      .then(function (data) {
+        state.token = data.token;
+        state.user = data.user;
+        localStorage.setItem(TOKEN_KEY, data.token);
+        $('auth-password').value = '';
+        enterApp();
+      })
+      .catch(function (err) { error.textContent = err.message; })
+      .finally(function () { button.disabled = false; });
+  });
+
+  function signOut(expired) {
+    state.token = '';
+    state.user = null;
+    state.status = null;
+    localStorage.removeItem(TOKEN_KEY);
+    clearInterval(state.timer);
+    $('app-view').classList.add('hidden');
+    $('auth-view').classList.remove('hidden');
+    setAuthMode('login');
+    if (expired) toast('登录已过期，请重新登录', true);
+  }
+
+  $('logout-btn').addEventListener('click', function () { signOut(false); });
+
+  function enterApp() {
+    $('auth-view').classList.add('hidden');
+    $('app-view').classList.remove('hidden');
+    $('user-chip').innerHTML = 'HI, <b>' + esc(state.user.username) + '</b>' + (state.user.isAdmin ? ' · ADMIN' : '');
+    document.querySelectorAll('.admin-only').forEach(function (el) {
+      el.classList.toggle('hidden', !state.user.isAdmin);
+    });
+    document.querySelectorAll('.admin-col').forEach(function (el) {
+      el.classList.toggle('hidden', !state.user.isAdmin);
+    });
+    switchView('dashboard');
+    loadStatus();
+    if (state.timer) clearInterval(state.timer);
+    state.timer = setInterval(tick, 1000);
+  }
+
+  /* ===================== 视图 ===================== */
+
+  function switchView(view) {
+    state.view = view;
+    ['dashboard', 'board', 'settings'].forEach(function (name) {
+      $('view-' + name).classList.toggle('hidden', name !== view);
+    });
+    document.querySelectorAll('.nav button').forEach(function (btn) {
+      btn.classList.toggle('active', btn.getAttribute('data-view') === view);
+    });
+    if (view === 'board') loadBoard();
+    if (view === 'settings') loadSettings();
+    if (view === 'dashboard') loadStatus();
+  }
+
+  document.querySelectorAll('.nav button').forEach(function (btn) {
+    btn.addEventListener('click', function () { switchView(btn.getAttribute('data-view')); });
+  });
+
+  /* ===================== 今日打卡 ===================== */
+
+  function loadStatus() {
+    return api('/api/status').then(applyStatus).catch(function (err) {
+      if (err.status !== 401) toast(err.message, true);
+    });
+  }
+
+  function applyStatus(status) {
+    state.status = status;
+    state.user = Object.assign({}, state.user, status.user);
+    state.deadlineAt = Date.now() + status.secondsUntilDeadline * 1000;
+
+    var pill = $('status-pill');
+    pill.textContent = STATUS_TEXT[status.status] || status.status;
+    pill.className = 'pill ' + status.status;
+
+    $('skip-banner').classList.toggle('hidden', !status.isSkipDay);
+
+    var hint = $('status-hint');
+    if (status.status === 'done') hint.textContent = '按时打卡，漂亮。明天同一时间见。';
+    else if (status.status === 'late') hint.textContent = '打上了，但已经过了 ' + status.deadline + '，下次早点。';
+    else if (status.status === 'excused') hint.textContent = '今天请假：' + (status.excuseReason || '');
+    else if (status.status === 'holiday') hint.textContent = '今天是免打卡日，不打也不断签，连胜保持不变。';
+    else if (status.status === 'missed') hint.textContent = '截止时间已过，还没打卡 —— 请补一条借口，或者现在立刻打卡（记为迟到）。';
+    else hint.textContent = '今天还有时间，别拖到最后一秒。';
+
+    if (status.blocked && status.status !== 'missed') {
+      hint.textContent = '注意：你在 ' + status.blockDate + ' 漏签且未请假，手机 App 会拦住你，需要先补借口。';
+    }
+
+    $('streak-num').textContent = status.streak;
+    $('best-num').textContent = status.bestStreak;
+    $('total-num').textContent = status.totalCheckins;
+    $('stat-deadline').textContent = status.deadline;
+    $('stat-today').textContent = status.today;
+    $('stat-tz').textContent = status.timezone;
+
+    var checkinBtn = $('checkin-btn');
+    checkinBtn.disabled = status.checkedIn;
+    checkinBtn.textContent = status.checkedIn
+      ? (status.late ? '今天已打卡（迟到）' : '今天已打卡')
+      : '立即打卡';
+
+    if (status.status === 'missed') $('excuse-form').classList.remove('hidden');
+
+    tick();
+  }
+
+  function tick() {
+    var el = $('countdown');
+    if (!state.status || !el) return;
+    var status = state.status;
+
+    if (status.checkedIn || status.status === 'excused' || status.status === 'holiday') {
+      el.innerHTML = '';
+      return;
+    }
+    if (status.deadlinePassed || !state.deadlineAt) {
+      el.innerHTML = '<b style="color:var(--red)">已超过截止时间</b>，需要填写借口才能解锁 App';
+      return;
+    }
+
+    var left = (state.deadlineAt - Date.now()) / 1000;
+    if (left <= 0) { el.innerHTML = '<b style="color:var(--red)">已到截止时间</b>'; return; }
+
+    var h = Math.floor(left / 3600);
+    var m = Math.floor((left % 3600) / 60);
+    var s = Math.floor(left % 60);
+    el.innerHTML = '距 ' + esc(status.deadline) + ' 截止还有 <b>' +
+      (h > 0 ? h + 'h ' : '') + m + 'm ' + String(s).padStart(2, '0') + 's</b>';
+  }
+
+  $('checkin-btn').addEventListener('click', function () {
+    var btn = $('checkin-btn');
+    btn.disabled = true;
+    api('/api/checkin', { method: 'POST', body: {} })
+      .then(function (data) {
+        applyStatus(data.status);
+        toast(data.alreadyCheckedIn ? '今天已经打过卡了' : (data.late ? '打卡成功（迟到）' : '打卡成功，连胜 +1'));
+      })
+      .catch(function (err) {
+        toast(err.message, true);
+        btn.disabled = false;
+      });
+  });
+
+  $('excuse-toggle').addEventListener('click', function () {
+    $('excuse-form').classList.toggle('hidden');
+    if (!$('excuse-form').classList.contains('hidden')) $('excuse-reason').focus();
+  });
+
+  $('excuse-cancel').addEventListener('click', function () {
+    $('excuse-form').classList.add('hidden');
+  });
+
+  $('excuse-form').addEventListener('submit', function (event) {
+    event.preventDefault();
+    var reason = $('excuse-reason').value.trim();
+    if (reason.length < 2) { toast('借口至少写 2 个字', true); return; }
+
+    api('/api/excuse', { method: 'POST', body: { reason: reason } })
+      .then(function (data) {
+        $('excuse-reason').value = '';
+        $('excuse-form').classList.add('hidden');
+        applyStatus(data.status);
+        toast('借口已提交，今天记为请假');
+      })
+      .catch(function (err) { toast(err.message, true); });
+  });
+
+  /* ===================== 排行榜 ===================== */
+
+  function statusBadge(value) {
+    var text = STATUS_BADGE[value] || value;
+    return '<span class="badge ' + esc(value) + '">' + esc(text) + '</span>';
+  }
+
+  function loadBoard() {
+    var body = $('board-body');
+    body.innerHTML = '<tr><td colspan="6" class="empty">LOADING…</td></tr>';
+
+    api('/api/leaderboard?period=' + encodeURIComponent(state.period) + '&limit=200')
+      .then(function (data) {
+        $('score-head').textContent = data.period === 'all' ? '连续' : (data.period === 'week' ? '本周' : '本月');
+        $('board-meta').textContent =
+          data.periodLabel + ' · 共 ' + data.total + ' 人 · ' + data.timezone +
+          (data.isSkipDay ? ' · 今天是免打卡日' : '');
+
+        if (!data.rows.length) {
+          body.innerHTML = '<tr><td colspan="6" class="empty">还没有人上榜</td></tr>';
+          return;
+        }
+
+        body.innerHTML = data.rows.map(function (row) {
+          var rankClass = row.rank === 1 ? 'top1' : row.rank === 2 ? 'top2' : row.rank === 3 ? 'top3' : '';
+          var medal = row.rank === 1 ? '🥇' : row.rank === 2 ? '🥈' : row.rank === 3 ? '🥉' : row.rank;
+          var initial = esc(row.username.slice(0, 1).toUpperCase());
+          var unit = data.period === 'all' ? ' 天' : ' 次';
+          var adminCol = state.user.isAdmin
+            ? '<td class="admin-col"><button class="danger-link" data-reset="' + row.userId + '" data-name="' + esc(row.username) + '" type="button">重置</button></td>'
+            : '<td class="admin-col hidden"></td>';
+          return (
+            '<tr class="' + (row.isMe ? 'me' : '') + '">' +
+              '<td><span class="rank ' + rankClass + '">' + medal + '</span></td>' +
+              '<td><div class="who"><span class="avatar">' + initial + '</span>' + esc(row.username) +
+                (row.isMe ? ' <span class="badge">我</span>' : '') +
+                (row.isAdmin ? ' <span class="badge">ADMIN</span>' : '') + '</div></td>' +
+              '<td><span class="num big">' + row.score + '</span>' + unit + '</td>' +
+              '<td class="best"><span class="num">' + row.bestStreak + '</span> 天</td>' +
+              '<td>' + statusBadge(row.todayStatus) + '</td>' +
+              adminCol +
+            '</tr>'
+          );
+        }).join('');
+
+        body.querySelectorAll('[data-reset]').forEach(function (btn) {
+          btn.addEventListener('click', function () {
+            resetUser(btn.getAttribute('data-reset'), btn.getAttribute('data-name'));
+          });
+        });
+      })
+      .catch(function (err) { toast(err.message, true); });
+  }
+
+  document.querySelectorAll('#period-tabs button').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      state.period = btn.getAttribute('data-period');
+      document.querySelectorAll('#period-tabs button').forEach(function (b) {
+        b.classList.toggle('active', b === btn);
+      });
+      loadBoard();
+    });
+  });
+
+  function resetUser(userId, username) {
+    if (!confirm('确定要重置「' + username + '」今天的打卡状态，并把连续天数清零吗？')) return;
+    api('/api/admin/users/' + userId + '/reset', { method: 'POST', body: { resetStreak: true } })
+      .then(function () {
+        toast('已重置 ' + username);
+        loadBoard();
+        loadStatus();
+      })
+      .catch(function (err) { toast(err.message, true); });
+  }
+
+  $('board-refresh').addEventListener('click', loadBoard);
+
+  /* ===================== 设置 ===================== */
+
+  function renderSkipDates(dates) {
+    var box = $('skip-list');
+    if (!dates || !dates.length) {
+      box.innerHTML = '<span class="inline-hint">暂无</span>';
+      return;
+    }
+    box.innerHTML = dates.map(function (d) {
+      return '<span class="skip-chip">' + esc(d) + '</span>';
+    }).join('');
+  }
+
+  function loadSettings() {
+    api('/api/settings').then(function (data) {
+      $('deadline-input').value = data.deadline;
+      $('deadline-hint').textContent = data.userDeadline
+        ? '当前使用个人设置。全局默认：' + data.defaultDeadline + '（' + data.timezone + '）'
+        : '当前跟随全局默认：' + data.defaultDeadline + '（' + data.timezone + '）';
+      $('account-username').value = state.user.username;
+      renderSkipDates(data.skipDates);
+
+      if (state.user.isAdmin) {
+        $('admin-deadline').value = data.defaultDeadline;
+        $('admin-skip').value = (data.skipDates || []).join(', ');
+        $('admin-skip-hint').textContent = data.skipDates.length
+          ? '共 ' + data.skipDates.length + ' 天' + (data.isSkipToday ? ' · 今天是免打卡日' : '')
+          : '未设置';
+      }
+    }).catch(function (err) { toast(err.message, true); });
+  }
+
+  $('deadline-form').addEventListener('submit', function (event) {
+    event.preventDefault();
+    var value = $('deadline-input').value;
+    if (!value) { toast('请选择时间', true); return; }
+    api('/api/settings', { method: 'PUT', body: { deadline: value } })
+      .then(function (data) {
+        toast('截止时间已更新为 ' + data.deadline);
+        loadSettings();
+        loadStatus();
+      })
+      .catch(function (err) { toast(err.message, true); });
+  });
+
+  $('deadline-default').addEventListener('click', function () {
+    api('/api/settings', { method: 'PUT', body: { deadline: null } })
+      .then(function (data) {
+        toast('已改为跟随全局：' + data.deadline);
+        loadSettings();
+        loadStatus();
+      })
+      .catch(function (err) { toast(err.message, true); });
+  });
+
+  $('account-form').addEventListener('submit', function (event) {
+    event.preventDefault();
+    var username = $('account-username').value.trim();
+    var currentPassword = $('account-current').value;
+    var password = $('account-password').value;
+    var body = {};
+
+    if (username && username !== state.user.username) body.username = username;
+    if (password) {
+      body.password = password;
+      body.currentPassword = currentPassword;
+    }
+    if (!body.username && !body.password) { toast('没有需要修改的内容'); return; }
+
+    api('/api/account', { method: 'PUT', body: body })
+      .then(function (data) {
+        state.token = data.token;
+        state.user = data.user;
+        localStorage.setItem(TOKEN_KEY, data.token);
+        $('account-current').value = '';
+        $('account-password').value = '';
+        $('user-chip').innerHTML = 'HI, <b>' + esc(data.user.username) + '</b>' + (data.user.isAdmin ? ' · ADMIN' : '');
+        toast('账号已更新');
+      })
+      .catch(function (err) { toast(err.message, true); });
+  });
+
+  $('admin-form').addEventListener('submit', function (event) {
+    event.preventDefault();
+    var defaultDeadline = $('admin-deadline').value;
+    var skipRaw = $('admin-skip').value;
+
+    api('/api/admin/settings', {
+      method: 'PUT',
+      body: { defaultDeadline: defaultDeadline }
+    })
+      .then(function () {
+        return api('/api/admin/set-skip-dates', {
+          method: 'POST',
+          body: { dates: skipRaw }
+        });
+      })
+      .then(function (data) {
+        toast('系统设置已保存：免打卡日 ' + data.count + ' 天');
+        loadSettings();
+        loadStatus();
+        if (state.view === 'board') loadBoard();
+      })
+      .catch(function (err) { toast(err.message, true); });
+  });
+
+  /* ===================== 启动 ===================== */
+
+  (function boot() {
+    if (!state.token) return;
+    api('/api/me')
+      .then(function (data) {
+        state.user = data.user;
+        enterApp();
+        applyStatus(data.status);
+      })
+      .catch(function () { signOut(false); });
+  })();
+
+  document.addEventListener('visibilitychange', function () {
+    if (!document.hidden && state.token && state.view === 'dashboard') loadStatus();
+  });
+})();
+</script>
+</body>
+</html>
