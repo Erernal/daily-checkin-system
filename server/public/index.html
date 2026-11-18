@@ -260,6 +260,40 @@
   .num.big { font-size: 18px; color: var(--cyan); text-shadow: 0 0 14px rgba(0, 229, 255, .4); }
   .empty { padding: 40px; text-align: center; color: var(--muted); font-family: var(--mono); font-size: 13px; }
 
+  /* 好友 / 互动按钮 */
+  .mini {
+    padding: 6px 12px; border-radius: 8px; font-size: 12px; font-weight: 700; letter-spacing: .04em;
+    border: 1px solid transparent; white-space: nowrap;
+    transition: filter .15s, transform .12s, background .15s;
+  }
+  .mini:active { transform: scale(.96); opacity: .85; }
+  .mini:disabled { opacity: .45; cursor: not-allowed; transform: none; }
+  .mini.solid { background: var(--cyan); color: #04070E; box-shadow: 0 0 14px rgba(0, 229, 255, .45); }
+  .mini.solid:hover { filter: brightness(1.08); }
+  .mini.outline { border-color: rgba(0, 229, 255, .55); color: var(--cyan); background: rgba(0, 229, 255, .06); }
+  .mini.outline:hover { background: rgba(0, 229, 255, .16); }
+  .mini.purple { border-color: rgba(179, 136, 255, .55); color: var(--purple); background: rgba(179, 136, 255, .1); }
+  .mini.purple:hover { background: rgba(179, 136, 255, .2); }
+  .muted-text { color: var(--muted); font-size: 12px; font-family: var(--mono); }
+
+  .friend-item {
+    display: flex; align-items: center; gap: 10px;
+    padding: 10px 0; border-bottom: 1px solid var(--line-soft);
+  }
+  .friend-item:last-child { border-bottom: 0; }
+  .friend-avatar {
+    width: 30px; height: 30px; border-radius: 9px; display: grid; place-items: center;
+    background: rgba(0, 229, 255, .12); border: 1px solid var(--line);
+    color: var(--cyan); font-size: 12px; font-weight: 800; flex: none;
+  }
+  .friend-main { flex: 1; min-width: 0; }
+  .friend-name { font-size: 14px; font-weight: 600; }
+  .friend-sub { color: var(--muted); font-size: 11px; font-family: var(--mono); margin-top: 2px; }
+  .request-title {
+    color: var(--purple); font-size: 11px; letter-spacing: .16em;
+    font-family: var(--mono); margin: 6px 0 2px;
+  }
+
   /* ---------------- 设置 ---------------- */
   .settings { display: grid; gap: 16px; }
   .settings h2 { font-size: 15px; margin: 0 0 6px; letter-spacing: .14em; }
@@ -423,11 +457,12 @@
               <th style="width:104px" id="score-head">连续</th>
               <th class="best" style="width:86px">最佳</th>
               <th style="width:110px">今日</th>
+              <th style="width:104px">互动</th>
               <th class="admin-col hidden" style="width:92px">操作</th>
             </tr>
           </thead>
           <tbody id="board-body">
-            <tr><td colspan="6" class="empty">加载中…</td></tr>
+            <tr><td colspan="7" class="empty">加载中…</td></tr>
           </tbody>
         </table>
       </div>
@@ -459,6 +494,16 @@
           <h2>免打卡日 <span class="tag">HOLIDAY</span></h2>
           <p class="hint">免打卡日当天不打卡也不会断签，连胜冻结。以下为管理员设置的日期：</p>
           <div class="skip-list" id="skip-list"><span class="inline-hint">暂无</span></div>
+        </div>
+
+        <div class="card">
+          <h2>我的好友 <span class="tag" id="friend-count">0 人</span></h2>
+          <p class="hint">
+            好友之间可以互相催打卡：排行榜里「未打卡且不是自己」的行会出现「加好友 / 催一下」按钮。
+            对方发来的申请也会出现在这里。
+          </p>
+          <div id="incoming-list"></div>
+          <div id="friend-list"><p class="inline-hint">加载中…</p></div>
         </div>
 
         <div class="card">
@@ -672,7 +717,7 @@
       btn.classList.toggle('active', btn.getAttribute('data-view') === view);
     });
     if (view === 'board') loadBoard();
-    if (view === 'settings') loadSettings();
+    if (view === 'settings') { loadSettings(); loadFriends(); }
     if (view === 'dashboard') loadStatus();
   }
 
@@ -798,9 +843,77 @@
     return '<span class="badge ' + esc(value) + '">' + esc(text) + '</span>';
   }
 
+  /** 排行榜「互动」列：加好友 / 已申请 / 同意 / 催一下 */
+  function friendCell(row) {
+    if (row.isMe) return '<span class="muted-text">—</span>';
+    if (row.todayStatus === 'done' || row.todayStatus === 'late' || row.todayStatus === 'excused') {
+      return '<span class="muted-text">—</span>';
+    }
+    var attrs =
+      ' data-id="' + row.userId + '" data-name="' + esc(row.username) + '" type="button"';
+    if (row.friendship === 'accepted') {
+      return row.canNudge
+        ? '<button class="mini solid" data-friend="nudge"' + attrs + '>催一下</button>'
+        : '<span class="muted-text">—</span>';
+    }
+    if (row.friendship === 'pending_out') return '<span class="muted-text">已申请</span>';
+    if (row.friendship === 'pending_in') {
+      return '<button class="mini purple" data-friend="accept"' + attrs + '>同意</button>';
+    }
+    return '<button class="mini outline" data-friend="add"' + attrs + '>加好友</button>';
+  }
+
+  function bindFriendButtons(root) {
+    root.querySelectorAll('[data-friend]').forEach(function (btn) {
+      btn.addEventListener('click', function () {
+        handleFriendAction(
+          btn.getAttribute('data-friend'),
+          Number(btn.getAttribute('data-id')),
+          btn.getAttribute('data-name'),
+          btn
+        );
+      });
+    });
+  }
+
+  function handleFriendAction(kind, userId, username, btn) {
+    if (btn) btn.disabled = true;
+
+    var request;
+    if (kind === 'add') {
+      request = api('/api/friends/request', { method: 'POST', body: { userId: userId } }).then(
+        function (data) {
+          toast(
+            data.autoAccepted
+              ? '你和 ' + username + ' 已成为好友'
+              : '已向 ' + username + ' 发送好友申请'
+          );
+        }
+      );
+    } else if (kind === 'accept') {
+      request = api('/api/friends/accept', { method: 'POST', body: { userId: userId } }).then(
+        function () { toast('你和 ' + username + ' 已经是好友了'); }
+      );
+    } else {
+      request = api('/api/nudge/' + encodeURIComponent(username), { method: 'POST' }).then(
+        function (data) { toast(data.message || '已催 ' + username + ' 打卡'); }
+      );
+    }
+
+    request
+      .then(function () {
+        loadBoard();
+        loadFriends();
+      })
+      .catch(function (err) {
+        toast(err.message, true);
+        if (btn) btn.disabled = false;
+      });
+  }
+
   function loadBoard() {
     var body = $('board-body');
-    body.innerHTML = '<tr><td colspan="6" class="empty">LOADING…</td></tr>';
+    body.innerHTML = '<tr><td colspan="7" class="empty">LOADING…</td></tr>';
 
     api('/api/leaderboard?period=' + encodeURIComponent(state.period) + '&limit=200')
       .then(function (data) {
@@ -810,7 +923,7 @@
           (data.isSkipDay ? ' · 今天是免打卡日' : '');
 
         if (!data.rows.length) {
-          body.innerHTML = '<tr><td colspan="6" class="empty">还没有人上榜</td></tr>';
+          body.innerHTML = '<tr><td colspan="7" class="empty">还没有人上榜</td></tr>';
           return;
         }
 
@@ -831,10 +944,13 @@
               '<td><span class="num big">' + row.score + '</span>' + unit + '</td>' +
               '<td class="best"><span class="num">' + row.bestStreak + '</span> 天</td>' +
               '<td>' + statusBadge(row.todayStatus) + '</td>' +
+              '<td>' + friendCell(row) + '</td>' +
               adminCol +
             '</tr>'
           );
         }).join('');
+
+        bindFriendButtons(body);
 
         body.querySelectorAll('[data-reset]').forEach(function (btn) {
           btn.addEventListener('click', function () {
@@ -864,6 +980,65 @@
         loadStatus();
       })
       .catch(function (err) { toast(err.message, true); });
+  }
+
+  /** 设置页「我的好友」：好友列表 + 待处理申请 */
+  function loadFriends() {
+    var listBox = $('friend-list');
+    var incomingBox = $('incoming-list');
+    if (!listBox || !incomingBox) return;
+
+    api('/api/friends/list')
+      .then(function (data) {
+        $('friend-count').textContent = data.counts.friends + ' 人';
+
+        incomingBox.innerHTML = data.incoming.length
+          ? '<div class="request-title">待处理申请</div>' +
+            data.incoming
+              .map(function (req) {
+                return (
+                  '<div class="friend-item">' +
+                    '<div class="friend-avatar">' + esc(req.username.slice(0, 1).toUpperCase()) + '</div>' +
+                    '<div class="friend-main">' +
+                      '<div class="friend-name">' + esc(req.username) + '</div>' +
+                      '<div class="friend-sub">请求加你为好友</div>' +
+                    '</div>' +
+                    '<button class="mini purple" data-friend="accept" data-id="' + req.id +
+                      '" data-name="' + esc(req.username) + '" type="button">同意</button>' +
+                  '</div>'
+                );
+              })
+              .join('')
+          : '';
+
+        listBox.innerHTML = data.friends.length
+          ? data.friends
+              .map(function (friend) {
+                var action = friend.canNudge
+                  ? '<button class="mini solid" data-friend="nudge" data-id="' + friend.id +
+                    '" data-name="' + esc(friend.username) + '" type="button">催一下</button>'
+                  : '<span class="badge ' + esc(friend.todayStatus) + '">' +
+                    esc(STATUS_BADGE[friend.todayStatus] || friend.todayStatus) + '</span>';
+                return (
+                  '<div class="friend-item">' +
+                    '<div class="friend-avatar">' + esc(friend.username.slice(0, 1).toUpperCase()) + '</div>' +
+                    '<div class="friend-main">' +
+                      '<div class="friend-name">' + esc(friend.username) + '</div>' +
+                      '<div class="friend-sub">连 ' + friend.streak + ' 天 · 最佳 ' + friend.bestStreak + ' 天</div>' +
+                    '</div>' +
+                    action +
+                  '</div>'
+                );
+              })
+              .join('')
+          : '<p class="inline-hint">还没有好友，去排行榜找未打卡的人加一个。</p>';
+
+        bindFriendButtons(incomingBox);
+        bindFriendButtons(listBox);
+      })
+      .catch(function (err) {
+        if (err.status !== 401) toast(err.message, true);
+      });
   }
 
   $('board-refresh').addEventListener('click', loadBoard);

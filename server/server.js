@@ -1462,7 +1462,16 @@ function normalizeSkipDates(input) {
 
 /* ------------------------------- 静态资源 -------------------------------- */
 
-app.use(express.static(path.join(__dirname, 'public'), { extensions: ['html'], maxAge: '1h' }));
+app.use(
+  express.static(path.join(__dirname, 'public'), {
+    extensions: ['html'],
+    maxAge: '1h',
+    setHeaders(res, filePath) {
+      // 页面与接口相关资源不缓存，保证更新后刷新即可看到新版
+      if (filePath.endsWith('index.html')) res.setHeader('Cache-Control', 'no-cache');
+    },
+  })
+);
 
 app.get('/', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
