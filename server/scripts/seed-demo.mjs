@@ -1,14 +1,14 @@
 /**
- * 演示数据生成脚本（可选）
+ * 演示数据生成脚本（v3：多习惯模型）
  * ---------------------------------------------------------------
- * 生成一批带历史连胜的演示用户，方便本地预览 Web 后台与排行榜。
- * 注意：会清空这些演示用户的历史打卡记录，请勿在生产库运行。
+ * 生成一批带历史连胜的演示用户 + 好友关系，方便本地预览排行榜。
+ * 前提：已启动服务（脚本通过 API 注册，再直接写库补历史数据）。
  *
- * 用法（先启动服务）：
+ * 用法：
  *   node scripts/seed-demo.mjs
  *   API_BASE=http://127.0.0.1:3200 DB_PATH=./data/demo.db node scripts/seed-demo.mjs
  *
- * 统一密码：demo1234
+ * 统一密码：demo1234（仅演示数据）
  */
 
 import path from 'node:path';
@@ -22,12 +22,12 @@ const DB_PATH = process.env.DB_PATH
 const PASSWORD = 'demo1234';
 
 const DEMO_USERS = [
-  { username: '早起的鸟', streak: 21, best: 30, today: 'done', deadline: null },
-  { username: '小满', streak: 12, best: 12, today: 'done', deadline: '23:00' },
-  { username: '夜航', streak: 8, best: 15, today: 'late', deadline: '22:00' },
-  { username: '温言', streak: 5, best: 9, today: 'excused', deadline: null },
+  { username: '早起的鸟', streak: 21, best: 30, today: 'done' },
+  { username: '小满', streak: 12, best: 12, today: 'done' },
+  { username: '夜航', streak: 8, best: 15, today: 'late' },
+  { username: '温言', streak: 5, best: 9, today: 'excused' },
   { username: '阿懒', streak: 4, best: 11, today: 'missed', deadline: '09:00' },
-  { username: '咸鱼翻身', streak: 1, best: 6, today: 'pending', deadline: null },
+  { username: '咸鱼翻身', streak: 1, best: 6, today: 'pending' },
 ];
 
 const pad = (n) => String(n).padStart(2, '0');
@@ -66,10 +66,6 @@ for (const demo of DEMO_USERS) {
     res = await call('POST', '/api/login', {
       body: { username: demo.username, password: PASSWORD },
     });
-    if (res.status !== 200) {
-      console.warn(`  ! 跳过 ${demo.username}：${res.data.message || res.status}`);
-      continue;
-    }
   }
   if (!res.data || !res.data.user) {
     console.warn(`  ! 跳过 ${demo.username}：${res.data.message || res.status}`);
@@ -80,36 +76,57 @@ for (const demo of DEMO_USERS) {
   idByName.set(demo.username, id);
   const now = new Date().toISOString();
 
-  db.prepare('DELETE FROM checkins WHERE user_id = ?').run(id);
-  db.prepare('DELETE FROM excuses WHERE user_id = ?').run(id);
-
-  // 补齐历史打卡（截止日之前的 streak 天）
-  const insert = db.prepare(
-    'INSERT INTO checkins (user_id, date, late, note, created_at) VALUES (?, ?, 0, NULL, ?)'
-  );
-  for (let i = 1; i < demo.streak; i += 1) {
-    insert.run(id, addDays(today, -i), now);
+  // 每个用户建号时都会自动生成一个默认习惯，历史数据挂在这个习惯上
+  const habit = db
+    .prepare('SELECT * FROM habits WHERE user_id = ? ORDER BY id ASC LIMIT 1')
+    .get(id);
+  if (!habit) {
+    console.warn(`  ! ${demo.username} 没有默认习惯，跳过`);
+    continue;
   }
 
+  db.prepare('DELETE FROM checkins WHERE habit_id = ?').run(habit.id);
+  db.prepare('DELETE FROM excuses WHERE user_id = ?').run(id);
+
+  const insert = db.prepare(`
+    INSERT INTO checkins (habit_id, user_id, date, late, note, makeup, created_at)
+    VALUES (?, ?, ?, 0, NULL, 0, ?)
+  `);
+  for (let i = 1; i < demo.streak; i += 1) insert.run(habit.id, id, addDays(today, -i), now);
+
   if (demo.today === 'done' || demo.today === 'late') {
-    db.prepare(
-      'INSERT INTO checkins (user_id, date, late, note, created_at) VALUES (?, ?, ?, NULL, ?)'
-    ).run(id, today, demo.today === 'late' ? 1 : 0, now);
+    db.prepare(`
+      INSERT INTO checkins (habit_id, user_id, date, late, note, makeup, created_at)
+      VALUES (?, ?, ?, ?, NULL, 0, ?)
+    `).run(habit.id, id, today, demo.today === 'late' ? 1 : 0, now);
   }
   if (demo.today === 'excused') {
     db.prepare(
-      'INSERT INTO excuses (user_id, date, reason, created_at) VALUES (?, ?, ?, ?)'
+      'INSERT INTO excuses (user_id, date, reason, uses_leave, created_at) VALUES (?, ?, ?, 1, ?)'
     ).run(id, today, '临时被拉去开会，申请一次请假。', now);
   }
 
   const lastCounted =
-    demo.today === 'pending' || demo.today === 'missed'
-      ? addDays(today, -1)
-      : today;
+    demo.today === 'pending' || demo.today === 'missed' ? addDays(today, -1) : today;
 
-  db.prepare(
-    'UPDATE users SET current_streak = ?, best_streak = ?, last_counted_date = ?, deadline = ? WHERE id = ?'
-  ).run(demo.streak, demo.best, lastCounted, demo.deadline, id);
+  db.prepare(`
+    UPDATE habits SET current_streak = ?, best_streak = ?, last_counted_date = ?,
+      start_date = ?, deadline_time = ?, updated_at = ?
+    WHERE id = ?
+  `).run(
+    demo.streak,
+    demo.best,
+    lastCounted,
+    addDays(today, -30),
+    demo.deadline || '22:00',
+    now,
+    habit.id
+  );
+
+  db.prepare('UPDATE users SET points = ?, makeup_cards = 0 WHERE id = ?').run(
+    demo.streak * 10,
+    id
+  );
 
   console.log(
     `  ✓ ${demo.username.padEnd(6, ' ')} 连胜 ${String(demo.streak).padStart(2, ' ')} · 今日 ${demo.today}`

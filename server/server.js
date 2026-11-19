@@ -1,26 +1,19 @@
 'use strict';
 
 /* ==========================================================================
- *  不拖延 · 防拖延强制打卡系统 —— 后端服务 v2.0（赛博升级版）
+ *  不拖延 · 强制打卡系统 v3.0
  * --------------------------------------------------------------------------
- *  技术栈：Node.js 18+ / Express 4 / better-sqlite3 / JWT
+ *  Node.js 18+ / Express 4 / better-sqlite3 / JWT
  *
- *  v2.0 新增：
- *   · 强制北京时间（Asia/Shanghai），服务端所有日期计算不再受服务器/用户
- *     本地时区影响；
- *   · 排行榜支持 period=all|week|month（总榜 / 周榜 / 月榜）；
- *   · 好友系统（申请 / 同意 / 列表）与“催打卡”（必须是 accepted 好友）；
- *   · 免打卡日 skip_dates：当天不打卡也不断签，连胜冻结；
- *   · 个人 30 天打卡日历 /api/user/calendar；
- *   · 管理员设置免打卡日 /api/admin/set-skip-dates。
- *
- *  核心规则：
- *   1. “打卡日”= 北京时间的日历日，格式 YYYY-MM-DD。
- *   2. 截止时间前打卡 = done；截止后当天打卡 = late（仍计连胜）。
- *   3. 一整天既没打卡也没请假 = 断签，连胜清零（惰性结算）。
- *   4. 请假 = excused，连胜既不增加也不清零。
- *   5. 免打卡日 = holiday，不打卡也不断签，连胜冻结；当天也不触发强制阻断。
- *   6. 强制阻断：今天过截止仍未打卡/请假，或昨天漏签未补假 → blocked=true。
+ *  v3 新增：
+ *   · 打卡项 habits：active_days（生效星期）、deadline_time（每日截止）、
+ *     start_date（生效日期），支持多习惯、休息日、按习惯独立连胜；
+ *   · 结算按 habits.active_days 判定：休息日不断签、不扣分；
+ *   · 积分：打卡 +10、断签 -20、100 分兑换补签卡（断签时自动消耗保命）；
+ *   · 请假额度：每人每月 3 次，月初自动重置，无额度时请假不保连胜；
+ *   · 三榜：/api/leaderboard/streak | total | points（未登录只读可访问）；
+ *   · 勋章：连续 7 天 🛡️、30 天 👑；
+ *   · 设备号唯一：注册/登录可带 deviceId，users.device_id 唯一索引。
  * ========================================================================== */
 
 const fs = require('node:fs');
@@ -48,30 +41,29 @@ const DB_PATH = process.env.DB_PATH
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-only-secret-please-change-me';
 const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || '7d';
 
-/** 业务时区强制为北京时间：不读系统时区，也不允许普通用户修改 */
 const BUSINESS_TIMEZONE = 'Asia/Shanghai';
-
 const DEFAULT_DEADLINE = process.env.DEFAULT_DEADLINE || '22:00';
 
 const ADMIN_USERNAME = process.env.ADMIN_USERNAME || 'admin';
-/**
- * 管理员初始密码：
- *  · 生产环境不内置任何默认密码，未配置 ADMIN_PASSWORD 时随机生成，
- *    只在建号那一次打印到启动日志；
- *  · 开发环境保留内置默认密码方便本地调试，但不会出现在页面/日志/文档里。
- */
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || (IS_PROD ? '' : 'admin123');
+
+const POINTS_PER_CHECKIN = 10;
+const POINTS_PER_BREAK = 20;
+const MAKEUP_CARD_COST = 100;
+const LEAVE_PER_MONTH = 3;
+const MAX_HABITS = 20;
+const MAX_ACTIVE_DAYS = 7;
+
+const EXCUSE_LOOKBACK_DAYS = 7;
+const LEADERBOARD_MAX = 200;
+const CALENDAR_MAX_DAYS = 90;
+const SKIP_DATES_MAX = 365;
+const NUDGE_COOLDOWN_MS = 10 * 60 * 1000;
 
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '')
   .split(',')
   .map((s) => s.trim())
   .filter(Boolean);
-
-const EXCUSE_LOOKBACK_DAYS = 7; // 允许补填最近 7 天的借口
-const LEADERBOARD_MAX = 200;
-const CALENDAR_MAX_DAYS = 90;
-const SKIP_DATES_MAX = 365;
-const NUDGE_COOLDOWN_MS = 10 * 60 * 1000; // 同一个好友 10 分钟内只能催一次
 
 if (IS_PROD && JWT_SECRET === 'dev-only-secret-please-change-me') {
   console.warn('[warn] 生产环境请务必设置 JWT_SECRET 环境变量！');
@@ -80,14 +72,11 @@ if (IS_PROD && !process.env.ADMIN_PASSWORD) {
   console.warn('[warn] 生产环境未设置 ADMIN_PASSWORD，将随机生成管理员初始密码（只在建号时打印一次）');
 }
 if (!IS_PROD && !process.env.ADMIN_PASSWORD) {
-  console.warn(
-    '[warn] 正在使用开发环境默认管理员密码，仅限本地调试；' +
-      '部署到服务器请设置 ADMIN_PASSWORD 并加上 NODE_ENV=production'
-  );
+  console.warn('[warn] 正在使用开发环境默认管理员密码，仅限本地调试；部署请设置 ADMIN_PASSWORD 与 NODE_ENV=production');
 }
 
 /* --------------------------------------------------------------------------
- * 2. 数据库初始化（建表 + 幂等迁移）
+ * 2. 数据库与迁移
  * ------------------------------------------------------------------------ */
 
 fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
@@ -97,8 +86,37 @@ db.pragma('journal_mode = WAL');
 db.pragma('foreign_keys = ON');
 db.pragma('busy_timeout = 5000');
 
+const nowIso = () => new Date().toISOString();
+
+/* 北京时间格式化器要在迁移（ensureDefaultHabit 计算 start_date）之前就绪 */
+const formatter = new Intl.DateTimeFormat('en-GB', {
+  timeZone: BUSINESS_TIMEZONE,
+  hourCycle: 'h23',
+  year: 'numeric',
+  month: '2-digit',
+  day: '2-digit',
+  hour: '2-digit',
+  minute: '2-digit',
+  second: '2-digit',
+});
+const pad2 = (n) => String(n).padStart(2, '0');
+
+function tableColumns(name) {
+  try {
+    return db.prepare(`PRAGMA table_info(${name})`).all().map((c) => c.name);
+  } catch {
+    return [];
+  }
+}
+
+function ensureColumn(table, column, ddl) {
+  if (tableColumns(table).includes(column)) return false;
+  db.exec(`ALTER TABLE ${table} ADD COLUMN ${ddl}`);
+  return true;
+}
+
+/** 基础表（v1/v2 结构；新库直接建造成 v3 形状） */
 db.exec(`
-  /* ---------- v1 已有表 ---------- */
   CREATE TABLE IF NOT EXISTS users (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,
     username          TEXT    NOT NULL UNIQUE COLLATE NOCASE,
@@ -112,14 +130,32 @@ db.exec(`
     updated_at        TEXT    NOT NULL
   );
 
+  CREATE TABLE IF NOT EXISTS habits (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id           INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    name              TEXT    NOT NULL,
+    emoji             TEXT    NOT NULL DEFAULT '⏰',
+    active_days       TEXT    NOT NULL DEFAULT '1,2,3,4,5,6,7',
+    deadline_time     TEXT    NOT NULL DEFAULT '22:00',
+    start_date        TEXT    NOT NULL,
+    current_streak    INTEGER NOT NULL DEFAULT 0,
+    best_streak       INTEGER NOT NULL DEFAULT 0,
+    last_counted_date TEXT,
+    archived          INTEGER NOT NULL DEFAULT 0,
+    created_at        TEXT    NOT NULL,
+    updated_at        TEXT    NOT NULL
+  );
+
   CREATE TABLE IF NOT EXISTS checkins (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    habit_id   INTEGER NOT NULL REFERENCES habits(id) ON DELETE CASCADE,
     user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     date       TEXT    NOT NULL,
     late       INTEGER NOT NULL DEFAULT 0,
     note       TEXT,
+    makeup     INTEGER NOT NULL DEFAULT 0,
     created_at TEXT    NOT NULL,
-    UNIQUE (user_id, date)
+    UNIQUE (habit_id, date)
   );
 
   CREATE TABLE IF NOT EXISTS excuses (
@@ -127,6 +163,7 @@ db.exec(`
     user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     date       TEXT    NOT NULL,
     reason     TEXT    NOT NULL,
+    uses_leave INTEGER NOT NULL DEFAULT 1,
     created_at TEXT    NOT NULL,
     UNIQUE (user_id, date)
   );
@@ -145,23 +182,17 @@ db.exec(`
     created_at TEXT NOT NULL
   );
 
-  /* ---------- v2 新增：好友关系 ----------
-   * 约定：accepted 关系存两行（A→B、B→A），便于任意方向查询；
-   *       pending 只存一行（发起方 → 接收方）。
-   */
   CREATE TABLE IF NOT EXISTS friends (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     friend_id  INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    status     TEXT    NOT NULL DEFAULT 'pending'
-               CHECK (status IN ('pending', 'accepted')),
+    status     TEXT    NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'accepted')),
     created_at TEXT    NOT NULL,
     updated_at TEXT    NOT NULL,
     UNIQUE (user_id, friend_id),
     CHECK (user_id <> friend_id)
   );
 
-  /* ---------- v2 新增：催打卡记录 ---------- */
   CREATE TABLE IF NOT EXISTS nudges (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     from_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -170,12 +201,98 @@ db.exec(`
     created_at   TEXT    NOT NULL
   );
 
-  CREATE INDEX IF NOT EXISTS idx_checkins_user_date ON checkins (user_id, date);
-  CREATE INDEX IF NOT EXISTS idx_excuses_user_date  ON excuses (user_id, date);
-  CREATE INDEX IF NOT EXISTS idx_friends_user       ON friends (user_id, status);
-  CREATE INDEX IF NOT EXISTS idx_friends_friend     ON friends (friend_id, status);
-  CREATE INDEX IF NOT EXISTS idx_nudges_to_date     ON nudges (to_user_id, date);
+  CREATE INDEX IF NOT EXISTS idx_checkins_user_date  ON checkins (user_id, date);
+  CREATE INDEX IF NOT EXISTS idx_excuses_user_date   ON excuses (user_id, date);
+  CREATE INDEX IF NOT EXISTS idx_friends_user        ON friends (user_id, status);
+  CREATE INDEX IF NOT EXISTS idx_friends_friend      ON friends (friend_id, status);
+  CREATE INDEX IF NOT EXISTS idx_nudges_to_date      ON nudges (to_user_id, date);
+  CREATE INDEX IF NOT EXISTS idx_habits_user         ON habits (user_id, archived);
 `);
+
+/* 注意：必须在预编译语句之前完成迁移，否则旧库缺少新列会导致 prepare 失败 */
+migrate();
+
+/* ---------------------------- 增量迁移 ---------------------------- */
+
+function migrate() {
+  // users 新字段
+  ensureColumn('users', 'device_id', 'device_id TEXT');
+  ensureColumn('users', 'points', 'points INTEGER NOT NULL DEFAULT 0');
+  ensureColumn('users', 'leave_balance', `leave_balance INTEGER NOT NULL DEFAULT ${LEAVE_PER_MONTH}`);
+  ensureColumn('users', 'leave_month', 'leave_month TEXT');
+  ensureColumn('users', 'makeup_cards', 'makeup_cards INTEGER NOT NULL DEFAULT 0');
+
+  db.exec(
+    'CREATE UNIQUE INDEX IF NOT EXISTS idx_users_device ON users (device_id) WHERE device_id IS NOT NULL'
+  );
+
+  // excuses 是否消耗请假额度
+  ensureColumn('excuses', 'uses_leave', 'uses_leave INTEGER NOT NULL DEFAULT 1');
+
+  // checkins 从 v2（user_id,date）升级到 v3（habit_id,date）
+  const cols = tableColumns('checkins');
+  if (!cols.includes('habit_id')) {
+    console.log('[migrate] 正在把 checkins 升级为多习惯结构…');
+    db.exec('ALTER TABLE checkins RENAME TO checkins_v2_backup');
+    db.exec(`
+      CREATE TABLE checkins (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        habit_id   INTEGER NOT NULL REFERENCES habits(id) ON DELETE CASCADE,
+        user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        date       TEXT    NOT NULL,
+        late       INTEGER NOT NULL DEFAULT 0,
+        note       TEXT,
+        makeup     INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT    NOT NULL,
+        UNIQUE (habit_id, date)
+      );
+      CREATE INDEX IF NOT EXISTS idx_checkins_habit_date ON checkins (habit_id, date);
+      CREATE INDEX IF NOT EXISTS idx_checkins_user_date  ON checkins (user_id, date);
+    `);
+
+    const users = db.prepare('SELECT * FROM users').all();
+    const insert = db.prepare(`
+      INSERT OR IGNORE INTO checkins (habit_id, user_id, date, late, note, makeup, created_at)
+      VALUES (?, ?, ?, ?, ?, 0, ?)
+    `);
+
+    for (const user of users) {
+      const habit = ensureDefaultHabit(user);
+      const rows = db.prepare('SELECT * FROM checkins_v2_backup WHERE user_id = ?').all(user.id);
+      for (const row of rows) {
+        insert.run(habit.id, user.id, row.date, row.late, row.note, row.created_at);
+      }
+      db.prepare(
+        'UPDATE habits SET current_streak = ?, best_streak = ?, last_counted_date = ? WHERE id = ?'
+      ).run(user.current_streak || 0, user.best_streak || 0, user.last_counted_date, habit.id);
+    }
+    console.log(`[migrate] 完成：${users.length} 个用户，checkins 已迁移到默认习惯`);
+  }
+
+  // 每个用户至少有一个习惯
+  for (const user of db.prepare('SELECT * FROM users').all()) ensureDefaultHabit(user);
+
+  // 习惯维度索引只能在 habit_id 存在后创建
+  db.exec('CREATE INDEX IF NOT EXISTS idx_checkins_habit_date ON checkins (habit_id, date)');
+}
+
+/** 给用户兜底创建一个「每日打卡」习惯（老数据迁移 / 新用户注册都用它） */
+function ensureDefaultHabit(user, deadline) {
+  const existing = db
+    .prepare('SELECT * FROM habits WHERE user_id = ? ORDER BY id ASC LIMIT 1')
+    .get(user.id);
+  if (existing) return existing;
+
+  const start = dateKey(new Date(user.created_at || Date.now()));
+  const info = db
+    .prepare(`
+      INSERT INTO habits (user_id, name, emoji, active_days, deadline_time, start_date, created_at, updated_at)
+      VALUES (?, '每日打卡', '⏰', '1,2,3,4,5,6,7', ?, ?, ?, ?)
+    `)
+    .run(user.id, deadline || user.deadline || DEFAULT_DEADLINE, start, nowIso(), nowIso());
+
+  return db.prepare('SELECT * FROM habits WHERE id = ?').get(info.lastInsertRowid);
+}
 
 /* --------------------------------------------------------------------------
  * 3. 预编译语句
@@ -184,36 +301,62 @@ db.exec(`
 const q = {
   userById: db.prepare('SELECT * FROM users WHERE id = ?'),
   userByName: db.prepare('SELECT * FROM users WHERE username = ? COLLATE NOCASE'),
+  userByDevice: db.prepare('SELECT * FROM users WHERE device_id = ?'),
   allUsers: db.prepare('SELECT * FROM users ORDER BY id ASC'),
   insertUser: db.prepare(`
-    INSERT INTO users (username, password_hash, is_admin, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?)
+    INSERT INTO users (username, password_hash, is_admin, device_id, points, leave_balance, leave_month, created_at, updated_at)
+    VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?)
   `),
   updateUserDeadline: db.prepare('UPDATE users SET deadline = ?, updated_at = ? WHERE id = ?'),
-  updateUserStreak: db.prepare(
-    'UPDATE users SET current_streak = ?, last_counted_date = ?, updated_at = ? WHERE id = ?'
-  ),
-  updateUserBoth: db.prepare(`
-    UPDATE users SET current_streak = ?, best_streak = ?, last_counted_date = ?, updated_at = ?
-    WHERE id = ?
-  `),
   updateUsername: db.prepare('UPDATE users SET username = ?, updated_at = ? WHERE id = ?'),
   updatePassword: db.prepare('UPDATE users SET password_hash = ?, updated_at = ? WHERE id = ?'),
-
-  checkinOn: db.prepare('SELECT * FROM checkins WHERE user_id = ? AND date = ?'),
-  insertCheckin: db.prepare(
-    'INSERT INTO checkins (user_id, date, late, note, created_at) VALUES (?, ?, ?, ?, ?)'
+  updateDevice: db.prepare('UPDATE users SET device_id = ?, updated_at = ? WHERE id = ?'),
+  addPoints: db.prepare('UPDATE users SET points = MAX(0, points + ?), updated_at = ? WHERE id = ?'),
+  updateLeave: db.prepare('UPDATE users SET leave_balance = ?, leave_month = ?, updated_at = ? WHERE id = ?'),
+  takeLeave: db.prepare('UPDATE users SET leave_balance = leave_balance - 1, updated_at = ? WHERE id = ?'),
+  takeMakeup: db.prepare('UPDATE users SET makeup_cards = makeup_cards - 1, updated_at = ? WHERE id = ?'),
+  addMakeup: db.prepare('UPDATE users SET makeup_cards = makeup_cards + ?, updated_at = ? WHERE id = ?'),
+  syncUserStreak: db.prepare(
+    'UPDATE users SET current_streak = ?, best_streak = ?, last_counted_date = ?, updated_at = ? WHERE id = ?'
   ),
-  deleteCheckinOn: db.prepare('DELETE FROM checkins WHERE user_id = ? AND date = ?'),
-  countCheckins: db.prepare('SELECT COUNT(*) AS n FROM checkins WHERE user_id = ?'),
-  countCheckinsBetween: db.prepare(
-    'SELECT COUNT(*) AS n FROM checkins WHERE user_id = ? AND date BETWEEN ? AND ?'
+
+  habitsByUser: db.prepare('SELECT * FROM habits WHERE user_id = ? AND archived = 0 ORDER BY id ASC'),
+  habitById: db.prepare('SELECT * FROM habits WHERE id = ?'),
+  countHabits: db.prepare('SELECT COUNT(*) AS n FROM habits WHERE user_id = ? AND archived = 0'),
+  insertHabit: db.prepare(`
+    INSERT INTO habits (user_id, name, emoji, active_days, deadline_time, start_date, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `),
+  updateHabit: db.prepare(`
+    UPDATE habits SET name = ?, emoji = ?, active_days = ?, deadline_time = ?, start_date = ?, updated_at = ?
+    WHERE id = ? AND user_id = ?
+  `),
+  archiveHabit: db.prepare('UPDATE habits SET archived = 1, updated_at = ? WHERE id = ? AND user_id = ?'),
+  updateHabitStreak: db.prepare(
+    'UPDATE habits SET current_streak = ?, best_streak = ?, last_counted_date = ?, updated_at = ? WHERE id = ?'
+  ),
+  maxStreak: db.prepare(
+    'SELECT COALESCE(MAX(current_streak), 0) AS n FROM habits WHERE user_id = ? AND archived = 0'
+  ),
+  maxBestStreak: db.prepare(
+    'SELECT COALESCE(MAX(best_streak), 0) AS n FROM habits WHERE user_id = ? AND archived = 0'
+  ),
+
+  checkinOn: db.prepare('SELECT * FROM checkins WHERE habit_id = ? AND date = ?'),
+  insertCheckin: db.prepare(`
+    INSERT INTO checkins (habit_id, user_id, date, late, note, makeup, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `),
+  deleteCheckinsOn: db.prepare('DELETE FROM checkins WHERE user_id = ? AND date = ?'),
+  totalCheckins: db.prepare('SELECT COUNT(*) AS n FROM checkins WHERE user_id = ? AND makeup = 0'),
+  countBetween: db.prepare(
+    'SELECT COUNT(*) AS n FROM checkins WHERE user_id = ? AND makeup = 0 AND date BETWEEN ? AND ?'
   ),
 
   excuseOn: db.prepare('SELECT * FROM excuses WHERE user_id = ? AND date = ?'),
-  insertExcuse: db.prepare(
-    'INSERT INTO excuses (user_id, date, reason, created_at) VALUES (?, ?, ?, ?)'
-  ),
+  insertExcuse: db.prepare(`
+    INSERT INTO excuses (user_id, date, reason, uses_leave, created_at) VALUES (?, ?, ?, ?, ?)
+  `),
   deleteExcuseOn: db.prepare('DELETE FROM excuses WHERE user_id = ? AND date = ?'),
 
   getSetting: db.prepare('SELECT value FROM settings WHERE key = ?'),
@@ -224,7 +367,6 @@ const q = {
     'INSERT INTO audit_log (actor_id, action, target_id, detail, created_at) VALUES (?, ?, ?, ?, ?)'
   ),
 
-  /* 好友 */
   friendshipOne: db.prepare('SELECT * FROM friends WHERE user_id = ? AND friend_id = ?'),
   upsertFriendship: db.prepare(`
     INSERT INTO friends (user_id, friend_id, status, created_at, updated_at)
@@ -251,15 +393,12 @@ const q = {
     ORDER BY f.created_at DESC
   `),
 
-  /* 催打卡 */
   insertNudge: db.prepare(
     'INSERT INTO nudges (from_user_id, to_user_id, date, created_at) VALUES (?, ?, ?, ?)'
   ),
-  lastNudgeBetween: db.prepare(`
-    SELECT * FROM nudges
-    WHERE from_user_id = ? AND to_user_id = ?
-    ORDER BY id DESC LIMIT 1
-  `),
+  lastNudgeBetween: db.prepare(
+    'SELECT * FROM nudges WHERE from_user_id = ? AND to_user_id = ? ORDER BY id DESC LIMIT 1'
+  ),
   nudgesTodayFor: db.prepare(`
     SELECT n.id, n.created_at, u.username AS from_username
     FROM nudges n JOIN users u ON u.id = n.from_user_id
@@ -272,9 +411,6 @@ const q = {
  * 4. 种子数据
  * ------------------------------------------------------------------------ */
 
-const nowIso = () => new Date().toISOString();
-
-/** 生成随机初始密码（16 位 URL-safe） */
 function randomPassword() {
   return crypto.randomBytes(12).toString('base64url');
 }
@@ -283,7 +419,7 @@ function seed() {
   const defaults = {
     default_deadline: DEFAULT_DEADLINE,
     site_name: '不拖延',
-    skip_dates: '', // 逗号分隔的免打卡日，例如 2026-12-25,2027-01-01
+    skip_dates: '',
   };
   for (const [key, value] of Object.entries(defaults)) {
     if (!q.getSetting.get(key)) q.setSetting.run(key, value);
@@ -293,10 +429,21 @@ function seed() {
   if (!existing) {
     const generated = !ADMIN_PASSWORD;
     const initialPassword = generated ? randomPassword() : ADMIN_PASSWORD;
+    const now = nowIso();
+    const info = q.insertUser.run(
+      ADMIN_USERNAME,
+      hashPassword(initialPassword),
+      1,
+      null,
+      LEAVE_PER_MONTH,
+      currentMonth(),
+      now,
+      now
+    );
+    const admin = q.userById.get(info.lastInsertRowid);
+    ensureDefaultHabit(admin, defaultDeadline());
 
-    q.insertUser.run(ADMIN_USERNAME, hashPassword(initialPassword), 1, nowIso(), nowIso());
     console.log(`[seed] 已创建管理员账号：${ADMIN_USERNAME}`);
-
     if (generated) {
       console.log('[seed] 初始密码（仅打印这一次，登录后请立即修改）：');
       console.log(`[seed]   ${initialPassword}`);
@@ -339,21 +486,9 @@ function signToken(user) {
 }
 
 /* --------------------------------------------------------------------------
- * 6. 时间工具 —— 全部强制北京时间
+ * 6. 时间工具（强制北京时间；formatter / pad2 已在文件顶部定义）
  * ------------------------------------------------------------------------ */
 
-const formatter = new Intl.DateTimeFormat('en-GB', {
-  timeZone: BUSINESS_TIMEZONE,
-  hourCycle: 'h23',
-  year: 'numeric',
-  month: '2-digit',
-  day: '2-digit',
-  hour: '2-digit',
-  minute: '2-digit',
-  second: '2-digit',
-});
-
-/** 把任意时刻拆成北京时间的年月日时分秒 */
 function zonedParts(date = new Date()) {
   const parts = formatter.formatToParts(date);
   const bag = {};
@@ -368,12 +503,13 @@ function zonedParts(date = new Date()) {
   };
 }
 
-const pad2 = (n) => String(n).padStart(2, '0');
-
-/** 北京时间 YYYY-MM-DD */
 function dateKey(date = new Date()) {
   const p = zonedParts(date);
   return `${p.year}-${pad2(p.month)}-${pad2(p.day)}`;
+}
+
+function currentMonth() {
+  return dateKey().slice(0, 7);
 }
 
 function minutesOfDay(date = new Date()) {
@@ -386,21 +522,18 @@ function secondsOfDay(date = new Date()) {
   return p.hour * 3600 + p.minute * 60 + p.second;
 }
 
-/** 纯字符串日期加减，不受时区影响 */
 function addDays(key, delta) {
   const [y, m, d] = key.split('-').map(Number);
   const t = new Date(Date.UTC(y, m - 1, d) + delta * 86400000);
   return `${t.getUTCFullYear()}-${pad2(t.getUTCMonth() + 1)}-${pad2(t.getUTCDate())}`;
 }
 
-/** 周一为一周起点 */
 function startOfWeek(key) {
   const [y, m, d] = key.split('-').map(Number);
-  const dow = new Date(Date.UTC(y, m - 1, d)).getUTCDay(); // 0=周日
+  const dow = new Date(Date.UTC(y, m - 1, d)).getUTCDay();
   return addDays(key, -((dow + 6) % 7));
 }
 
-/** 1=周一 ... 7=周日 */
 function weekdayIndex(key) {
   const [y, m, d] = key.split('-').map(Number);
   const dow = new Date(Date.UTC(y, m - 1, d)).getUTCDay();
@@ -423,7 +556,7 @@ function isValidDateKey(value) {
 }
 
 /* --------------------------------------------------------------------------
- * 7. 设置与业务规则
+ * 7. 设置 / 免打卡日
  * ------------------------------------------------------------------------ */
 
 function getSetting(key, fallback = null) {
@@ -435,12 +568,6 @@ function defaultDeadline() {
   const value = getSetting('default_deadline', DEFAULT_DEADLINE);
   return TIME_RE.test(value) ? value : DEFAULT_DEADLINE;
 }
-
-function effectiveDeadline(user) {
-  return user && TIME_RE.test(user.deadline || '') ? user.deadline : defaultDeadline();
-}
-
-/* ---------------- 免打卡日 ---------------- */
 
 let skipDatesCache = null;
 
@@ -462,9 +589,7 @@ function isSkipDate(dateStr) {
 
 function nextSkipDate(fromDate) {
   let best = null;
-  for (const d of skipDates()) {
-    if (d >= fromDate && (!best || d < best)) best = d;
-  }
+  for (const d of skipDates()) if (d >= fromDate && (!best || d < best)) best = d;
   return best;
 }
 
@@ -475,103 +600,243 @@ function setSkipDates(list) {
   return sorted;
 }
 
-/* ---------------- 断签结算 ---------------- */
+/* --------------------------------------------------------------------------
+ * 8. 习惯工具
+ * ------------------------------------------------------------------------ */
+
+function parseActiveDays(csv) {
+  const set = new Set();
+  for (const piece of String(csv || '').split(',')) {
+    const n = Number(piece.trim());
+    if (Number.isInteger(n) && n >= 1 && n <= MAX_ACTIVE_DAYS) set.add(n);
+  }
+  return set;
+}
+
+function activeDaysToArray(csv) {
+  return Array.from(parseActiveDays(csv)).sort((a, b) => a - b);
+}
+
+/** 校验并规整 activeDays，返回 '1,2,3' 或 null（非法） */
+function normalizeActiveDays(input) {
+  if (input === undefined) return undefined;
+  let pieces;
+  if (Array.isArray(input)) pieces = input;
+  else if (typeof input === 'string') pieces = input.split(/[\s,]+/);
+  else return null;
+
+  const set = new Set();
+  for (const piece of pieces) {
+    const n = Number(String(piece).trim());
+    if (!Number.isInteger(n) || n < 1 || n > MAX_ACTIVE_DAYS) return null;
+    set.add(n);
+  }
+  if (!set.size) return null;
+  return Array.from(set).sort((a, b) => a - b).join(',');
+}
+
+/** 该习惯在某天是否生效（生效星期 + 开始日期） */
+function isActiveOn(habit, date) {
+  if (habit.archived) return false;
+  if (habit.start_date && date < habit.start_date) return false;
+  return parseActiveDays(habit.active_days).has(weekdayIndex(date));
+}
+
+/* --------------------------------------------------------------------------
+ * 9. 积分 / 请假 / 补签卡 / 勋章
+ * ------------------------------------------------------------------------ */
+
+function refreshUser(user) {
+  const fresh = q.userById.get(user.id);
+  return Object.assign(user, fresh);
+}
+
+/** 月初自动把请假额度重置为 3 */
+function ensureLeaveMonth(user) {
+  const month = currentMonth();
+  if (user.leave_month !== month) {
+    q.updateLeave.run(LEAVE_PER_MONTH, month, nowIso(), user.id);
+    user.leave_balance = LEAVE_PER_MONTH;
+    user.leave_month = month;
+  }
+  return user;
+}
+
+function addPoints(userId, delta) {
+  q.addPoints.run(delta, nowIso(), userId);
+}
+
+function consumeMakeup(user) {
+  if (!user.makeup_cards || user.makeup_cards <= 0) return false;
+  q.takeMakeup.run(nowIso(), user.id);
+  user.makeup_cards -= 1;
+  return true;
+}
+
+function badgesFor(bestStreak) {
+  const badges = [];
+  if (bestStreak >= 7) badges.push('🛡️');
+  if (bestStreak >= 30) badges.push('👑');
+  return badges;
+}
+
+/* --------------------------------------------------------------------------
+ * 10. 结算（按 habits.active_days）
+ * ------------------------------------------------------------------------ */
 
 /**
- * 惰性结算：把 last_counted_date 推进到昨天。
- * 期间若存在“非免打卡日且无打卡无请假”的日子，则连胜清零。
+ * 把某个 habit 的 last_counted_date 推进到昨天：
+ *  · 只在 active_days 内的日期要求打卡；
+ *  · 休息日 / 免打卡日直接跳过；
+ *  · 有 uses_leave=1 的请假 → 保连胜；
+ *  · 否则优先消耗补签卡（记为补签打卡），没有卡才断签并扣 20 分。
  */
-function settleUser(user, today = dateKey()) {
-  const marker = user.last_counted_date;
-  if (!marker) return user;
+function settleHabit(user, habit, today) {
+  const marker = habit.last_counted_date;
+  if (!marker) return false;
 
   const yesterday = addDays(today, -1);
-  if (marker >= yesterday) return user;
+  if (marker >= yesterday) return false;
 
-  let missed = false;
   let cursor = addDays(marker, 1);
+  let missed = false;
   let guard = 0;
+
   while (cursor <= yesterday && guard < 400) {
-    if (!isSkipDate(cursor) && !q.checkinOn.get(user.id, cursor) && !q.excuseOn.get(user.id, cursor)) {
-      missed = true;
+    if (isActiveOn(habit, cursor) && !isSkipDate(cursor)) {
+      const hasCheckin = q.checkinOn.get(habit.id, cursor);
+      const excuse = q.excuseOn.get(user.id, cursor);
+      const protectedByLeave = Boolean(excuse && excuse.uses_leave === 1);
+
+      if (!hasCheckin && !protectedByLeave) {
+        if (consumeMakeup(user)) {
+          q.insertCheckin.run(habit.id, user.id, cursor, 0, '补签卡', 1, nowIso());
+        } else {
+          missed = true;
+        }
+      }
     }
     cursor = addDays(cursor, 1);
     guard += 1;
   }
 
-  const nextStreak = missed ? 0 : user.current_streak;
-  q.updateUserStreak.run(nextStreak, yesterday, nowIso(), user.id);
-  user.current_streak = nextStreak;
-  user.last_counted_date = yesterday;
-  return user;
+  const nextStreak = missed ? 0 : habit.current_streak;
+  const nextBest = Math.max(habit.best_streak, nextStreak);
+
+  q.updateHabitStreak.run(nextStreak, nextBest, yesterday, nowIso(), habit.id);
+  if (missed) addPoints(user.id, -POINTS_PER_BREAK);
+
+  habit.current_streak = nextStreak;
+  habit.best_streak = nextBest;
+  habit.last_counted_date = yesterday;
+  return true;
 }
 
-/** 某一天的展示状态：done | late | excused | holiday | missed | pending */
-function todayStatusFor(user, today, deadline, nowMin) {
-  const checkin = q.checkinOn.get(user.id, today);
-  if (checkin) return checkin.late === 1 ? 'late' : 'done';
+/** 结算某个用户的全部习惯，并把 user 的聚合连胜同步过去 */
+function settleUser(user, today = dateKey()) {
+  const habits = q.habitsByUser.all(user.id);
+  let changed = false;
+  for (const habit of habits) {
+    if (settleHabit(user, habit, today)) changed = true;
+  }
+  if (changed) {
+    const streak = q.maxStreak.get(user.id).n;
+    const best = q.maxBestStreak.get(user.id).n;
+    const last = habits.reduce(
+      (acc, h) => (h.last_counted_date && h.last_counted_date > acc ? h.last_counted_date : acc),
+      null
+    );
+    q.syncUserStreak.run(streak, best, last, nowIso(), user.id);
+    refreshUser(user);
+  }
+  return changed;
+}
 
+/* --------------------------------------------------------------------------
+ * 11. 状态
+ * ------------------------------------------------------------------------ */
+
+function habitState(habit, user, today, now, nowMin) {
+  const activeToday = isActiveOn(habit, today);
+  const checkin = q.checkinOn.get(habit.id, today);
+  const deadlinePassed = nowMin >= hhmmToMinutes(habit.deadline_time);
   const excuse = q.excuseOn.get(user.id, today);
-  if (excuse) return 'excused';
 
-  if (isSkipDate(today)) return 'holiday';
-
-  return nowMin >= hhmmToMinutes(deadline) ? 'missed' : 'pending';
+  return {
+    id: habit.id,
+    name: habit.name,
+    emoji: habit.emoji,
+    activeDays: activeDaysToArray(habit.active_days),
+    deadlineTime: habit.deadline_time,
+    startDate: habit.start_date,
+    streak: habit.current_streak,
+    bestStreak: habit.best_streak,
+    isActiveToday: activeToday,
+    restToday: !activeToday,
+    checkedIn: Boolean(checkin),
+    late: Boolean(checkin && checkin.late === 1),
+    checkinAt: checkin ? checkin.created_at : null,
+    deadlinePassed,
+    canCheckin: activeToday && !checkin && !isSkipDate(today) && !excuse,
+    secondsUntilDeadline: deadlinePassed ? 0 : hhmmToMinutes(habit.deadline_time) * 60 - secondsOfDay(now),
+  };
 }
 
-function statusLabel(status) {
-  return (
-    {
-      pending: '待打卡',
-      done: '已打卡',
-      late: '迟到',
-      excused: '已请假',
-      missed: '漏签',
-      holiday: '免打卡',
-    }[status] || status
-  );
-}
-
-/** 今日完整状态 + 强制阻断判定 */
 function buildStatus(user, now = new Date()) {
   const today = dateKey(now);
   const yesterday = addDays(today, -1);
-  const deadline = effectiveDeadline(user);
   const nowMin = minutesOfDay(now);
-  const nowSec = secondsOfDay(now);
-  const deadlineMin = hhmmToMinutes(deadline);
-  const passed = nowMin >= deadlineMin;
   const holiday = isSkipDate(today);
 
-  const checkin = q.checkinOn.get(user.id, today);
-  const excuse = q.excuseOn.get(user.id, today);
-  const status = todayStatusFor(user, today, deadline, nowMin);
+  settleUser(user, today);
+  refreshUser(user);
+  ensureLeaveMonth(user);
 
-  // ---- 强制阻断 ----
+  const habits = q.habitsByUser.all(user.id);
+  const items = habits.map((h) => habitState(h, user, today, now, nowMin));
+  const active = items.filter((i) => i.isActiveToday);
+  const done = active.filter((i) => i.checkedIn);
+  const lateAny = done.some((i) => i.late);
+  const excuseToday = q.excuseOn.get(user.id, today);
+
+  let status;
+  if (holiday) status = 'holiday';
+  else if (excuseToday && !done.length) status = 'excused';
+  else if (!active.length) status = 'rest';
+  else if (done.length === active.length) status = lateAny ? 'late' : 'done';
+  else if (done.length > 0) status = 'partial';
+  else if (active.some((i) => i.deadlinePassed)) status = 'missed';
+  else status = 'pending';
+
+  const pendingPassed = active.some((i) => !i.checkedIn && i.deadlinePassed);
+  const missedYesterday =
+    !isSkipDate(yesterday) &&
+    habits.some((h) => {
+      if (!isActiveOn(h, yesterday)) return false;
+      if (q.checkinOn.get(h.id, yesterday)) return false;
+      // 只要填过借口（哪怕没额度）就不再反复拦截，但没额度不会保连胜
+      return !q.excuseOn.get(user.id, yesterday);
+    });
+
   let blocked = false;
   let blockDate = null;
   let blockReason = null;
 
-  if (!holiday) {
-    if (!checkin && !excuse && passed) {
+  if (!holiday && !excuseToday) {
+    if (pendingPassed) {
       blocked = true;
       blockDate = today;
       blockReason = 'TODAY_DEADLINE_PASSED';
-    } else {
-      const registeredAt = dateKey(new Date(user.created_at));
-      const yesterdaySettled =
-        yesterday >= registeredAt && !isSkipDate(yesterday)
-          ? Boolean(q.checkinOn.get(user.id, yesterday) || q.excuseOn.get(user.id, yesterday))
-          : true;
-      if (!yesterdaySettled) {
-        blocked = true;
-        blockDate = yesterday;
-        blockReason = 'YESTERDAY_MISSED';
-      }
+    } else if (missedYesterday) {
+      blocked = true;
+      blockDate = yesterday;
+      blockReason = 'YESTERDAY_MISSED';
     }
   }
 
-  const totalCheckins = q.countCheckins.get(user.id).n;
+  const streak = q.maxStreak.get(user.id).n;
+  const best = q.maxBestStreak.get(user.id).n;
+  const totalCheckins = q.totalCheckins.get(user.id).n;
   const nudges = q.nudgesTodayFor.all(user.id, today).map((row) => ({
     id: row.id,
     from: row.from_username,
@@ -585,42 +850,80 @@ function buildStatus(user, now = new Date()) {
       isAdmin: user.is_admin === 1,
       deadline: user.deadline,
       createdAt: user.created_at,
+      points: user.points,
+      leaveBalance: user.leave_balance,
+      makeupCards: user.makeup_cards,
+      badges: badgesFor(best),
     },
     today,
     timezone: BUSINESS_TIMEZONE,
-    deadline,
     serverTime: now.toISOString(),
     isSkipDay: holiday,
     nextSkipDate: nextSkipDate(today),
     status,
-    statusLabel: statusLabel(status),
-    checkedIn: Boolean(checkin),
-    checkedInAt: checkin ? checkin.created_at : null,
-    late: Boolean(checkin && checkin.late === 1),
-    excused: Boolean(excuse),
-    excuseReason: excuse ? excuse.reason : null,
-    streak: user.current_streak,
-    bestStreak: user.best_streak,
+    statusLabel: {
+      pending: '待打卡',
+      done: '已打卡',
+      late: '迟到',
+      partial: '部分完成',
+      excused: '已请假',
+      missed: '漏签',
+      holiday: '免打卡',
+      rest: '今日休息',
+    }[status] || status,
+    streak,
+    bestStreak: best,
     totalCheckins,
+    points: user.points,
+    leaveBalance: user.leave_balance,
+    makeupCards: user.makeup_cards,
+    badges: badgesFor(best),
+    habits: items,
+    todayActiveCount: active.length,
+    todayDoneCount: done.length,
     blocked,
     blockDate,
     blockReason,
-    deadlinePassed: passed,
-    secondsUntilDeadline: passed ? 0 : Math.max(0, deadlineMin * 60 - nowSec),
+    deadlinePassed: active.length ? active.every((i) => i.deadlinePassed) : false,
+    secondsUntilDeadline: active.length
+      ? Math.min(...active.map((i) => i.secondsUntilDeadline))
+      : 0,
     nudges,
   };
 }
 
+/** 轻量版：只算今日状态（排行榜用） */
+function todayStatusOf(user, today, nowMin) {
+  if (isSkipDate(today)) return 'holiday';
+  const habits = q.habitsByUser.all(user.id);
+  const active = habits.filter((h) => isActiveOn(h, today));
+  if (!active.length) return 'rest';
+
+  const done = active.filter((h) => q.checkinOn.get(h.id, today));
+  if (done.length === active.length) {
+    return done.some((h) => q.checkinOn.get(h.id, today).late === 1) ? 'late' : 'done';
+  }
+  if (q.excuseOn.get(user.id, today)) return 'excused';
+  if (active.some((h) => nowMin >= hhmmToMinutes(h.deadline_time))) return 'missed';
+  return 'pending';
+}
+
 function serializeUser(user) {
+  const best = q.maxBestStreak.get(user.id).n;
   return {
     id: user.id,
     username: user.username,
     isAdmin: user.is_admin === 1,
     deadline: user.deadline,
-    streak: user.current_streak,
-    bestStreak: user.best_streak,
+    streak: q.maxStreak.get(user.id).n,
+    bestStreak: best,
     lastCountedDate: user.last_counted_date,
     createdAt: user.created_at,
+    points: user.points,
+    leaveBalance: user.leave_balance,
+    makeupCards: user.makeup_cards,
+    badges: badgesFor(best),
+    deviceBound: Boolean(user.device_id),
   };
 }
 
@@ -628,9 +931,10 @@ function publicError(res, status, code, message, extra) {
   return res.status(status).json(Object.assign({ error: code, message }, extra || {}));
 }
 
-/* ---------------- 好友关系 ---------------- */
+/* --------------------------------------------------------------------------
+ * 12. 好友关系
+ * ------------------------------------------------------------------------ */
 
-/** 一次性取回与 me 相关的全部关系，避免排行榜 N+1 */
 function buildFriendMap(meId) {
   const map = new Map();
   const pendingIn = new Set();
@@ -638,15 +942,10 @@ function buildFriendMap(meId) {
 
   for (const row of q.friendshipsOf.all(meId, meId)) {
     const other = row.user_id === meId ? row.friend_id : row.user_id;
-    if (row.status === 'accepted') {
-      map.set(other, 'accepted');
-    } else if (row.user_id === meId) {
-      pendingOut.add(other);
-    } else {
-      pendingIn.add(other);
-    }
+    if (row.status === 'accepted') map.set(other, 'accepted');
+    else if (row.user_id === meId) pendingOut.add(other);
+    else pendingIn.add(other);
   }
-
   for (const id of pendingOut) if (!map.has(id)) map.set(id, 'pending_out');
   for (const id of pendingIn) if (!map.has(id)) map.set(id, 'pending_in');
   return map;
@@ -663,16 +962,91 @@ function friendshipState(a, b) {
   return 'none';
 }
 
-/* ---------------- 排行榜周期 ---------------- */
+/* --------------------------------------------------------------------------
+ * 13. 排行榜
+ * ------------------------------------------------------------------------ */
 
-function periodRange(period, today) {
-  if (period === 'week') return { start: startOfWeek(today), end: today, label: '本周' };
-  if (period === 'month') return { start: `${today.slice(0, 7)}-01`, end: today, label: '本月' };
-  return { start: null, end: null, label: '总榜' };
+const BOARD_TYPES = {
+  streak: { label: '连胜榜', unit: '天' },
+  total: { label: '总次数榜', unit: '次' },
+  points: { label: '积分榜', unit: '分' },
+};
+
+function buildBoard(type, me, limit) {
+  const now = new Date();
+  const today = dateKey(now);
+  const nowMin = minutesOfDay(now);
+  const friendMap = me ? buildFriendMap(me.id) : null;
+
+  const rows = q.allUsers.all().map((user) => {
+    settleUser(user, today);
+    ensureLeaveMonth(user);
+    refreshUser(user);
+
+    const streak = q.maxStreak.get(user.id).n;
+    const best = q.maxBestStreak.get(user.id).n;
+    const total = q.totalCheckins.get(user.id).n;
+    const points = user.points;
+    const todayStatus = todayStatusOf(user, today, nowMin);
+    const checkedInToday = todayStatus === 'done' || todayStatus === 'late';
+    const friendship = friendMap
+      ? friendMap.get(user.id) || (me && user.id === me.id ? 'self' : 'none')
+      : null;
+
+    const value = type === 'total' ? total : type === 'points' ? points : streak;
+
+    return {
+      userId: user.id,
+      username: user.username,
+      isAdmin: user.is_admin === 1,
+      value,
+      score: value,
+      streak,
+      bestStreak: best,
+      totalCheckins: total,
+      points,
+      badges: badgesFor(best),
+      todayStatus,
+      friendship,
+      canNudge: Boolean(
+        me &&
+          friendship === 'accepted' &&
+          !checkedInToday &&
+          !isSkipDate(today) &&
+          user.id !== me.id
+      ),
+      isMe: Boolean(me && user.id === me.id),
+      createdAt: user.created_at,
+    };
+  });
+
+  rows.sort((a, b) => {
+    if (b.value !== a.value) return b.value - a.value;
+    if (b.streak !== a.streak) return b.streak - a.streak;
+    if (b.totalCheckins !== a.totalCheckins) return b.totalCheckins - a.totalCheckins;
+    return String(a.createdAt).localeCompare(String(b.createdAt));
+  });
+
+  const ranked = rows.map((row, index) => ({ rank: index + 1, ...row }));
+  const meta = BOARD_TYPES[type] || BOARD_TYPES.streak;
+
+  return {
+    type,
+    typeLabel: meta.label,
+    unit: meta.unit,
+    period: type,
+    generatedAt: now.toISOString(),
+    timezone: BUSINESS_TIMEZONE,
+    today,
+    isSkipDay: isSkipDate(today),
+    total: ranked.length,
+    rows: ranked.slice(0, limit),
+    me: me ? ranked.find((r) => r.userId === me.id) || null : null,
+  };
 }
 
 /* --------------------------------------------------------------------------
- * 8. 简易限流
+ * 14. 限流
  * ------------------------------------------------------------------------ */
 
 const buckets = new Map();
@@ -694,7 +1068,7 @@ setInterval(() => {
 }, 600_000).unref();
 
 /* --------------------------------------------------------------------------
- * 9. Express 应用
+ * 15. Express 应用
  * ------------------------------------------------------------------------ */
 
 const app = express();
@@ -715,38 +1089,38 @@ app.use((req, res, next) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('X-Frame-Options', 'DENY');
   res.setHeader('Referrer-Policy', 'no-referrer');
-  const started = process.hrtime.bigint();
-  res.on('finish', () => {
-    if (req.path.startsWith('/api')) {
-      const ms = Number(process.hrtime.bigint() - started) / 1e6;
-      console.log(`[api] ${req.method} ${req.originalUrl} -> ${res.statusCode} ${ms.toFixed(1)}ms`);
-    }
-  });
   next();
 });
 
-function authRequired(req, res, next) {
+function loadUserFromToken(req) {
   const header = req.headers.authorization || '';
   const token = header.startsWith('Bearer ') ? header.slice(7).trim() : '';
-  if (!token) return publicError(res, 401, 'UNAUTHORIZED', '请先登录');
-
-  let payload;
+  if (!token) return { token: '', error: 'NO_TOKEN' };
   try {
-    payload = jwt.verify(token, JWT_SECRET);
+    const payload = jwt.verify(token, JWT_SECRET);
+    const user = q.userById.get(Number(payload.sub));
+    if (!user) return { token, error: 'USER_NOT_FOUND' };
+    return { token, user };
   } catch (err) {
-    const expired = err && err.name === 'TokenExpiredError';
-    return publicError(
-      res,
-      401,
-      expired ? 'TOKEN_EXPIRED' : 'TOKEN_INVALID',
-      expired ? '登录已过期，请重新登录' : '登录凭证无效'
-    );
+    return { token, error: err && err.name === 'TokenExpiredError' ? 'TOKEN_EXPIRED' : 'TOKEN_INVALID' };
   }
+}
 
-  const user = q.userById.get(Number(payload.sub));
-  if (!user) return publicError(res, 401, 'USER_NOT_FOUND', '账号不存在或已被删除');
+function authRequired(req, res, next) {
+  const { user, error } = loadUserFromToken(req);
+  if (!user) {
+    if (error === 'NO_TOKEN') return publicError(res, 401, 'UNAUTHORIZED', '请先登录');
+    if (error === 'TOKEN_EXPIRED') return publicError(res, 401, 'TOKEN_EXPIRED', '登录已过期，请重新登录');
+    return publicError(res, 401, 'TOKEN_INVALID', '登录凭证无效');
+  }
+  req.user = ensureLeaveMonth(user);
+  next();
+}
 
-  req.user = user;
+/** 可选登录：排行榜等接口即使未登录也能只读访问 */
+function optionalAuth(req, res, next) {
+  const { user } = loadUserFromToken(req);
+  req.user = user || null;
   next();
 }
 
@@ -757,20 +1131,20 @@ function adminRequired(req, res, next) {
   next();
 }
 
-/** 结算 + 返回最新用户（断签惰性结算的唯一入口） */
 function freshUser(user) {
+  ensureLeaveMonth(user);
   settleUser(user, dateKey());
+  refreshUser(user);
   return user;
 }
 
 /* ------------------------------- 健康检查 -------------------------------- */
 
 app.get('/api/health', (req, res) => {
-  // 公开探活接口不返回运行环境等内部信息
   res.json({
     ok: true,
     service: 'qiangzhi-checkin',
-    version: '2.0.0',
+    version: '3.0.0',
     timezone: BUSINESS_TIMEZONE,
     now: new Date().toISOString(),
     today: dateKey(),
@@ -792,31 +1166,56 @@ function validateCredentials(username, password) {
   return null;
 }
 
+function normalizeDeviceId(value) {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  if (trimmed.length < 8 || trimmed.length > 128) return null;
+  return trimmed;
+}
+
 app.post('/api/register', (req, res) => {
   const ip = req.ip || 'unknown';
   if (!rateLimit({ key: `reg:${ip}`, limit: 20, windowMs: 3600_000 })) {
     return publicError(res, 429, 'TOO_MANY_REQUESTS', '注册过于频繁，请稍后再试');
   }
 
-  const { username, password } = req.body || {};
+  const body = req.body || {};
+  const { username, password } = body;
   const problem = validateCredentials(username, password);
   if (problem) return publicError(res, 400, 'INVALID_INPUT', problem);
 
   const name = String(username).trim();
-  if (q.userByName.get(name)) {
-    return publicError(res, 409, 'USERNAME_TAKEN', '该用户名已被注册');
+  if (q.userByName.get(name)) return publicError(res, 409, 'USERNAME_TAKEN', '该用户名已被注册');
+
+  const deviceId = normalizeDeviceId(body.deviceId);
+  if (body.deviceId && !deviceId) {
+    return publicError(res, 400, 'INVALID_DEVICE', '设备标识格式不正确');
+  }
+  if (deviceId && q.userByDevice.get(deviceId)) {
+    return publicError(res, 409, 'DEVICE_TAKEN', '该设备已注册过账号，请直接登录');
   }
 
   const now = nowIso();
-  const info = q.insertUser.run(name, hashPassword(password), 0, now, now);
+  const info = q.insertUser.run(
+    name,
+    hashPassword(password),
+    0,
+    deviceId,
+    LEAVE_PER_MONTH,
+    currentMonth(),
+    now,
+    now
+  );
   const user = q.userById.get(info.lastInsertRowid);
+  ensureDefaultHabit(user, defaultDeadline());
 
   console.log(`[auth] 新用户注册：${user.username} (#${user.id})`);
   res.status(201).json({ token: signToken(user), user: serializeUser(user) });
 });
 
 app.post('/api/login', (req, res) => {
-  const { username, password } = req.body || {};
+  const body = req.body || {};
+  const { username, password } = body;
   if (typeof username !== 'string' || typeof password !== 'string') {
     return publicError(res, 400, 'INVALID_INPUT', '请输入用户名和密码');
   }
@@ -831,11 +1230,22 @@ app.post('/api/login', (req, res) => {
     return publicError(res, 401, 'BAD_CREDENTIALS', '用户名或密码错误');
   }
 
-  freshUser(user);
+  const deviceId = normalizeDeviceId(body.deviceId);
+  if (deviceId) {
+    if (user.device_id && user.device_id !== deviceId) {
+      return publicError(res, 403, 'DEVICE_MISMATCH', '该账号已绑定其他设备，请联系管理员解绑');
+    }
+    if (!user.device_id) q.updateDevice.run(deviceId, nowIso(), user.id);
+  }
+
+  ensureLeaveMonth(user);
+  settleUser(user, dateKey());
+  refreshUser(user);
+
   res.json({ token: signToken(user), user: serializeUser(user) });
 });
 
-/* ------------------------------- 打卡状态 -------------------------------- */
+/* ------------------------------- 状态 ------------------------------------ */
 
 app.get('/api/me', authRequired, (req, res) => {
   const user = freshUser(req.user);
@@ -847,48 +1257,239 @@ app.get('/api/status', authRequired, (req, res) => {
   res.json(buildStatus(user));
 });
 
+/* ------------------------------- 习惯 CRUD -------------------------------- */
+
+app.get('/api/habits', authRequired, (req, res) => {
+  const user = freshUser(req.user);
+  const now = new Date();
+  const status = buildStatus(user, now);
+  res.json({ today: status.today, habits: status.habits });
+});
+
+function validateHabitPayload(body, { partial = false } = {}) {
+  const out = {};
+
+  if (body.name !== undefined || !partial) {
+    const name = String(body.name || '').trim();
+    if (name.length < 1 || name.length > 30) return { error: '习惯名称需为 1-30 个字符' };
+    out.name = name;
+  }
+
+  if (body.emoji !== undefined || !partial) {
+    const emoji = String(body.emoji || '⏰').trim().slice(0, 4) || '⏰';
+    out.emoji = emoji;
+  }
+
+  if (body.activeDays !== undefined || !partial) {
+    const normalized = normalizeActiveDays(
+      body.activeDays === undefined ? '1,2,3,4,5,6,7' : body.activeDays
+    );
+    if (!normalized) return { error: '请至少选择一个生效星期（1=周一 … 7=周日）' };
+    out.activeDays = normalized;
+  }
+
+  if (body.deadlineTime !== undefined || !partial) {
+    const time = String(body.deadlineTime || defaultDeadline());
+    if (!TIME_RE.test(time)) return { error: '截止时间格式应为 HH:MM' };
+    out.deadlineTime = time;
+  }
+
+  if (body.startDate !== undefined || !partial) {
+    const start = String(body.startDate || dateKey());
+    if (!isValidDateKey(start)) return { error: '开始日期格式应为 YYYY-MM-DD' };
+    out.startDate = start;
+  }
+
+  return out;
+}
+
+app.post('/api/habits', authRequired, (req, res) => {
+  const user = req.user;
+  if (q.countHabits.get(user.id).n >= MAX_HABITS) {
+    return publicError(res, 400, 'TOO_MANY_HABITS', `最多创建 ${MAX_HABITS} 个习惯`);
+  }
+
+  const payload = validateHabitPayload(req.body || {});
+  if (payload.error) return publicError(res, 400, 'INVALID_INPUT', payload.error);
+
+  const now = nowIso();
+  const today = dateKey();
+  const info = q.insertHabit.run(
+    user.id,
+    payload.name,
+    payload.emoji,
+    payload.activeDays,
+    payload.deadlineTime,
+    payload.startDate,
+    now,
+    now
+  );
+  const habit = q.habitById.get(info.lastInsertRowid);
+  if (isActiveOn(habit, today)) {
+    q.updateHabitStreak.run(0, 0, addDays(today, -1), nowIso(), habit.id);
+  }
+
+  console.log(`[habit] ${user.username} 创建习惯「${payload.name}」`);
+  res.status(201).json({ ok: true, habit: habitState(habit, user, today, new Date(), minutesOfDay()) });
+});
+
+app.put('/api/habits/:id', authRequired, (req, res) => {
+  const user = freshUser(req.user);
+  const habit = q.habitById.get(Number(req.params.id));
+  if (!habit || habit.user_id !== user.id || habit.archived) {
+    return publicError(res, 404, 'HABIT_NOT_FOUND', '习惯不存在');
+  }
+
+  const body = req.body || {};
+  const payload = validateHabitPayload(
+    {
+      name: body.name === undefined ? habit.name : body.name,
+      emoji: body.emoji === undefined ? habit.emoji : body.emoji,
+      activeDays: body.activeDays === undefined ? habit.active_days : body.activeDays,
+      deadlineTime: body.deadlineTime === undefined ? habit.deadline_time : body.deadlineTime,
+      startDate: body.startDate === undefined ? habit.start_date : body.startDate,
+    },
+    { partial: false }
+  );
+  if (payload.error) return publicError(res, 400, 'INVALID_INPUT', payload.error);
+
+  q.updateHabit.run(
+    payload.name,
+    payload.emoji,
+    payload.activeDays,
+    payload.deadlineTime,
+    payload.startDate,
+    nowIso(),
+    habit.id,
+    user.id
+  );
+
+  const updated = q.habitById.get(habit.id);
+  res.json({
+    ok: true,
+    habit: habitState(updated, user, dateKey(), new Date(), minutesOfDay()),
+  });
+});
+
+app.delete('/api/habits/:id', authRequired, (req, res) => {
+  const user = req.user;
+  const habit = q.habitById.get(Number(req.params.id));
+  if (!habit || habit.user_id !== user.id || habit.archived) {
+    return publicError(res, 404, 'HABIT_NOT_FOUND', '习惯不存在');
+  }
+  q.archiveHabit.run(nowIso(), habit.id, user.id);
+  res.json({ ok: true });
+});
+
+/* ------------------------------- 打卡 ------------------------------------ */
+
+function performCheckin(user, habit, now = new Date()) {
+  const today = dateKey(now);
+  const existing = q.checkinOn.get(habit.id, today);
+  if (existing) {
+    return { alreadyCheckedIn: true, habit, status: null };
+  }
+
+  const late = minutesOfDay(now) >= hhmmToMinutes(habit.deadline_time) ? 1 : 0;
+  const yesterday = addDays(today, -1);
+  const continuing = habit.last_counted_date === yesterday;
+  const nextStreak = continuing ? habit.current_streak + 1 : 1;
+  const nextBest = Math.max(habit.best_streak, nextStreak);
+  const note = null;
+
+  const tx = db.transaction(() => {
+    q.insertCheckin.run(habit.id, user.id, today, late, note, 0, now.toISOString());
+    q.updateHabitStreak.run(nextStreak, nextBest, today, now.toISOString(), habit.id);
+    q.addPoints.run(POINTS_PER_CHECKIN, now.toISOString(), user.id);
+  });
+  tx();
+
+  habit.current_streak = nextStreak;
+  habit.best_streak = nextBest;
+  habit.last_counted_date = today;
+  refreshUser(user);
+
+  return { alreadyCheckedIn: false, habit, late: late === 1, gainedStreak: nextStreak };
+}
+
+app.post('/api/habits/:id/checkin', authRequired, (req, res) => {
+  const now = new Date();
+  const user = freshUser(req.user);
+  const habit = q.habitById.get(Number(req.params.id));
+
+  if (!habit || habit.user_id !== user.id || habit.archived) {
+    return publicError(res, 404, 'HABIT_NOT_FOUND', '习惯不存在');
+  }
+  if (!isActiveOn(habit, dateKey(now))) {
+    return publicError(res, 400, 'REST_DAY', '今天是这个习惯的休息日');
+  }
+  if (isSkipDate(dateKey(now))) {
+    return publicError(res, 400, 'SKIP_DAY', '今天是免打卡日');
+  }
+
+  const result = performCheckin(user, habit, now);
+  if (result.alreadyCheckedIn) {
+    return res.json({ ok: true, alreadyCheckedIn: true, status: buildStatus(user, now) });
+  }
+
+  console.log(`[checkin] ${user.username} ${habit.name} ${dateKey(now)} late=${result.late}`);
+  res.status(201).json({
+    ok: true,
+    alreadyCheckedIn: false,
+    habitId: habit.id,
+    late: result.late,
+    gainedStreak: result.gainedStreak,
+    pointsEarned: POINTS_PER_CHECKIN,
+    status: buildStatus(user, now),
+  });
+});
+
+/** 兼容旧客户端的单打卡接口：不带 habitId 时自动挑一个今天未完成且生效的习惯 */
 app.post('/api/checkin', authRequired, (req, res) => {
   const now = new Date();
-  const today = dateKey(now);
   const user = freshUser(req.user);
+  const today = dateKey(now);
+  const body = req.body || {};
 
-  const existing = q.checkinOn.get(user.id, today);
-  if (existing) {
-    return res.status(200).json({
+  if (body.habitId !== undefined) {
+    const habit = q.habitById.get(Number(body.habitId));
+    if (!habit || habit.user_id !== user.id || habit.archived) {
+      return publicError(res, 404, 'HABIT_NOT_FOUND', '习惯不存在');
+    }
+    if (!isActiveOn(habit, today)) return publicError(res, 400, 'REST_DAY', '今天是休息日');
+    const result = performCheckin(user, habit, now);
+    return res.status(result.alreadyCheckedIn ? 200 : 201).json({
       ok: true,
-      alreadyCheckedIn: true,
+      alreadyCheckedIn: result.alreadyCheckedIn,
+      habitId: habit.id,
+      late: Boolean(result.late),
       status: buildStatus(user, now),
     });
   }
 
-  const deadline = effectiveDeadline(user);
-  const late = minutesOfDay(now) >= hhmmToMinutes(deadline) ? 1 : 0;
-  const yesterday = addDays(today, -1);
-  const continuing = user.last_counted_date === yesterday;
-  const nextStreak = continuing ? user.current_streak + 1 : 1;
-  const nextBest = Math.max(user.best_streak, nextStreak);
-  const note = typeof (req.body || {}).note === 'string' ? String(req.body.note).slice(0, 200) : null;
+  const pending = q.habitsByUser
+    .all(user.id)
+    .filter((h) => isActiveOn(h, today) && !q.checkinOn.get(h.id, today));
 
-  const tx = db.transaction(() => {
-    q.insertCheckin.run(user.id, today, late, note, now.toISOString());
-    q.updateUserBoth.run(nextStreak, nextBest, today, now.toISOString(), user.id);
-  });
-  tx();
+  if (!pending.length) {
+    const active = q.habitsByUser.all(user.id).filter((h) => isActiveOn(h, today));
+    if (active.length) {
+      return res.json({ ok: true, alreadyCheckedIn: true, status: buildStatus(user, now) });
+    }
+    return publicError(res, 400, 'NO_ACTIVE_HABIT', '今天没有待打卡的习惯');
+  }
 
-  user.current_streak = nextStreak;
-  user.best_streak = nextBest;
-  user.last_counted_date = today;
-
-  console.log(`[checkin] ${user.username} ${today} late=${late} streak=${nextStreak}`);
-
-  res.status(201).json({
+  const result = performCheckin(user, pending[0], now);
+  res.status(result.alreadyCheckedIn ? 200 : 201).json({
     ok: true,
-    alreadyCheckedIn: false,
-    late: late === 1,
-    gainedStreak: nextStreak,
+    alreadyCheckedIn: result.alreadyCheckedIn,
+    habitId: pending[0].id,
+    late: Boolean(result.late),
     status: buildStatus(user, now),
   });
 });
+
+/* ------------------------------- 请假 ------------------------------------ */
 
 app.post('/api/excuse', authRequired, (req, res) => {
   const now = new Date();
@@ -907,296 +1508,122 @@ app.post('/api/excuse', authRequired, (req, res) => {
   }
   const earliest = addDays(today, -EXCUSE_LOOKBACK_DAYS);
   if (targetDate > today || targetDate < earliest) {
-    return publicError(
-      res,
-      400,
-      'DATE_OUT_OF_RANGE',
-      `只能为最近 ${EXCUSE_LOOKBACK_DAYS} 天内的漏签补填借口`
-    );
-  }
-
-  if (q.checkinOn.get(user.id, targetDate)) {
-    return publicError(res, 409, 'ALREADY_CHECKED_IN', '该日期已打卡，无需填写借口');
+    return publicError(res, 400, 'DATE_OUT_OF_RANGE', `只能为最近 ${EXCUSE_LOOKBACK_DAYS} 天内的漏签补填借口`);
   }
 
   if (q.excuseOn.get(user.id, targetDate)) {
     return res.json({ ok: true, alreadyExcused: true, status: buildStatus(user, now) });
   }
 
+  const useLeave = user.leave_balance > 0;
   const tx = db.transaction(() => {
-    q.insertExcuse.run(user.id, targetDate, reason, now.toISOString());
+    q.insertExcuse.run(user.id, targetDate, reason, useLeave ? 1 : 0, now.toISOString());
+    if (useLeave) q.takeLeave.run(now.toISOString(), user.id);
     if (!user.last_counted_date || targetDate > user.last_counted_date) {
-      q.updateUserStreak.run(user.current_streak, targetDate, now.toISOString(), user.id);
-      user.last_counted_date = targetDate;
+      q.syncUserStreak.run(user.current_streak, user.best_streak, targetDate, now.toISOString(), user.id);
     }
   });
   tx();
 
-  console.log(`[excuse] ${user.username} ${targetDate} reason=${reason.slice(0, 30)}`);
+  refreshUser(user);
+
+  console.log(`[excuse] ${user.username} ${targetDate} leave=${useLeave}`);
 
   res.status(201).json({
     ok: true,
     alreadyExcused: false,
     date: targetDate,
+    usedLeave: useLeave,
+    leaveBalance: user.leave_balance,
     status: buildStatus(user, now),
   });
 });
 
 /* ------------------------------- 排行榜 ---------------------------------- */
 
-app.get('/api/leaderboard', authRequired, (req, res) => {
-  const period = ['all', 'week', 'month'].includes(String(req.query.period))
-    ? String(req.query.period)
-    : 'all';
-  const limit = Math.min(
-    LEADERBOARD_MAX,
-    Math.max(1, Number.parseInt(req.query.limit, 10) || 50)
-  );
-
-  const now = new Date();
-  const today = dateKey(now);
-  const nowMin = minutesOfDay(now);
-  const { start, end, label } = periodRange(period, today);
-  const friendMap = buildFriendMap(req.user.id);
-
-  const all = q.allUsers.all().map((user) => {
-    settleUser(user, today);
-    const deadline = effectiveDeadline(user);
-    const todayStatus = todayStatusFor(user, today, deadline, nowMin);
-    const score =
-      period === 'all' ? user.current_streak : q.countCheckinsBetween.get(user.id, start, end).n;
-    const friendship = friendMap.get(user.id) || (user.id === req.user.id ? 'self' : 'none');
-    const checkedInToday = todayStatus === 'done' || todayStatus === 'late';
-
-    return {
-      userId: user.id,
-      username: user.username,
-      isAdmin: user.is_admin === 1,
-      score,
-      streak: user.current_streak,
-      bestStreak: user.best_streak,
-      todayStatus,
-      deadline,
-      friendship,
-      canNudge:
-        friendship === 'accepted' &&
-        !checkedInToday &&
-        !isSkipDate(today) &&
-        user.id !== req.user.id,
-      isMe: user.id === req.user.id,
-      createdAt: user.created_at,
-    };
-  });
-
-  all.sort((a, b) => {
-    if (b.score !== a.score) return b.score - a.score;
-    if (b.streak !== a.streak) return b.streak - a.streak;
-    if (b.bestStreak !== a.bestStreak) return b.bestStreak - a.bestStreak;
-    return String(a.createdAt).localeCompare(String(b.createdAt));
-  });
-
-  const rows = all.map((row, index) => ({ rank: index + 1, ...row }));
-
-  res.json({
-    period,
-    periodLabel: label,
-    range: { start, end },
-    generatedAt: now.toISOString(),
-    timezone: BUSINESS_TIMEZONE,
-    today,
-    isSkipDay: isSkipDate(today),
-    total: rows.length,
-    rows: rows.slice(0, limit).map((row) => ({ ...row, isMe: row.userId === req.user.id })),
-    me: rows.find((row) => row.userId === req.user.id) || null,
-  });
-});
-
-/* ------------------------------- 好友系统 -------------------------------- */
-
-/** 把 {username} / {userId} 解析成用户行 */
-function resolveBodyUser(body) {
-  const payload = body || {};
-  if (payload.userId !== undefined && payload.userId !== null) {
-    const id = Number(payload.userId);
-    return Number.isInteger(id) ? q.userById.get(id) || null : null;
-  }
-  if (typeof payload.username === 'string' && payload.username.trim()) {
-    return q.userByName.get(payload.username.trim()) || null;
-  }
-  return null;
+function boardHandler(type) {
+  return (req, res) => {
+    const limit = Math.min(LEADERBOARD_MAX, Math.max(1, Number.parseInt(req.query.limit, 10) || 50));
+    res.json(buildBoard(type, req.user, limit));
+  };
 }
 
-app.post('/api/friends/request', authRequired, (req, res) => {
-  const me = req.user;
-  const target = resolveBodyUser(req.body);
-  if (!target) return publicError(res, 404, 'USER_NOT_FOUND', '对方不存在');
-  if (target.id === me.id) return publicError(res, 400, 'CANNOT_FRIEND_SELF', '不能加自己为好友');
+app.get('/api/leaderboard/streak', optionalAuth, boardHandler('streak'));
+app.get('/api/leaderboard/total', optionalAuth, boardHandler('total'));
+app.get('/api/leaderboard/points', optionalAuth, boardHandler('points'));
 
-  const state = friendshipState(me.id, target.id);
-  if (state === 'accepted') {
-    return publicError(res, 409, 'ALREADY_FRIENDS', '你们已经是好友了');
-  }
-  if (state === 'pending_out') {
-    return publicError(res, 409, 'REQUEST_EXISTS', '好友申请已发送，等待对方同意');
+/** 兼容旧接口：/api/leaderboard → 连胜榜；带 period 参数时按周/月打卡次数排序 */
+app.get('/api/leaderboard', optionalAuth, (req, res) => {
+  const period = String(req.query.period || 'all');
+  const limit = Math.min(LEADERBOARD_MAX, Math.max(1, Number.parseInt(req.query.limit, 10) || 50));
+
+  if (period === 'week' || period === 'month') {
+    const today = dateKey();
+    const start = period === 'week' ? startOfWeek(today) : `${today.slice(0, 7)}-01`;
+    const rows = q.allUsers.all().map((user) => {
+      settleUser(user, today);
+      const total = q.countBetween.get(user.id, start, today).n;
+      return {
+        userId: user.id,
+        username: user.username,
+        isAdmin: user.is_admin === 1,
+        score: total,
+        value: total,
+        streak: q.maxStreak.get(user.id).n,
+        bestStreak: q.maxBestStreak.get(user.id).n,
+        totalCheckins: q.totalCheckins.get(user.id).n,
+        points: user.points,
+        badges: badgesFor(q.maxBestStreak.get(user.id).n),
+        todayStatus: todayStatusOf(user, today, minutesOfDay()),
+        isMe: Boolean(req.user && req.user.id === user.id),
+        createdAt: user.created_at,
+      };
+    });
+    rows.sort((a, b) => b.score - a.score || b.streak - a.streak);
+    return res.json({
+      type: 'total',
+      period,
+      periodLabel: period === 'week' ? '本周' : '本月',
+      range: { start, end: today },
+      timezone: BUSINESS_TIMEZONE,
+      today,
+      total: rows.length,
+      rows: rows.slice(0, limit).map((r, i) => ({ rank: i + 1, ...r })),
+    });
   }
 
-  const now = nowIso();
-  const autoAccepted = state === 'pending_in';
+  res.json(buildBoard('streak', req.user, limit));
+});
+
+/* ------------------------------- 商店 ------------------------------------ */
+
+app.post('/api/shop/makeup-card', authRequired, (req, res) => {
+  const user = freshUser(req.user);
+  const quantity = Math.max(1, Math.min(5, Number((req.body || {}).quantity) || 1));
+  const cost = MAKEUP_CARD_COST * quantity;
+
+  if (user.points < cost) {
+    return publicError(res, 400, 'NOT_ENOUGH_POINTS', `积分不足，需要 ${cost} 分`, {
+      points: user.points,
+      cost,
+    });
+  }
 
   const tx = db.transaction(() => {
-    if (autoAccepted) {
-      // 对方先申请了我，我这次申请直接互加
-      q.upsertFriendship.run(me.id, target.id, 'accepted', now, now);
-      q.upsertFriendship.run(target.id, me.id, 'accepted', now, now);
-    } else {
-      q.upsertFriendship.run(me.id, target.id, 'pending', now, now);
-    }
+    q.addPoints.run(-cost, nowIso(), user.id);
+    q.addMakeup.run(quantity, nowIso(), user.id);
   });
   tx();
+  refreshUser(user);
 
-  console.log(
-    `[friend] ${me.username} -> ${target.username} ${autoAccepted ? '互相申请自动成为好友' : '发送申请'}`
-  );
-
-  res.status(autoAccepted ? 200 : 201).json({
-    ok: true,
-    autoAccepted,
-    status: autoAccepted ? 'accepted' : 'pending_out',
-    friend: { id: target.id, username: target.username },
-  });
-});
-
-app.post('/api/friends/accept', authRequired, (req, res) => {
-  const me = req.user;
-  const requester = resolveBodyUser(req.body);
-
-  if (!requester) {
-    return publicError(res, 404, 'USER_NOT_FOUND', '申请人不存在');
-  }
-
-  const pending = q.friendshipOne.get(requester.id, me.id);
-  if (!pending || pending.status !== 'pending') {
-    return publicError(res, 404, 'NO_PENDING_REQUEST', '没有待处理的好友申请');
-  }
-
-  const now = nowIso();
-  const tx = db.transaction(() => {
-    q.upsertFriendship.run(requester.id, me.id, 'accepted', now, now);
-    q.upsertFriendship.run(me.id, requester.id, 'accepted', now, now);
-  });
-  tx();
-
-  console.log(`[friend] ${me.username} 同意了 ${requester.username} 的好友申请`);
-
-  res.json({
-    ok: true,
-    friend: { id: requester.id, username: requester.username },
-    state: 'accepted',
-  });
-});
-
-app.get('/api/friends/list', authRequired, (req, res) => {
-  const me = freshUser(req.user);
-  const today = dateKey();
-  const nowMin = minutesOfDay();
-  const holidays = isSkipDate(today);
-
-  const friends = q.acceptedFriends.all(me.id).map((row) => {
-    const deadline = effectiveDeadline(row);
-    const todayStatus = todayStatusFor(row, today, deadline, nowMin);
-    const checkedInToday = todayStatus === 'done' || todayStatus === 'late';
-    return {
-      id: row.id,
-      username: row.username,
-      streak: row.current_streak,
-      bestStreak: row.best_streak,
-      todayStatus,
-      checkedInToday,
-      deadline,
-      since: row.friends_since,
-      canNudge: !checkedInToday && !holidays && todayStatus !== 'excused',
-    };
-  });
-
-  friends.sort((a, b) => b.streak - a.streak);
-
-  const incoming = q.incomingRequests.all(me.id).map((row) => ({
-    id: row.id,
-    username: row.username,
-    requestedAt: row.requested_at,
-  }));
-  const outgoing = q.outgoingRequests.all(me.id).map((row) => ({
-    id: row.id,
-    username: row.username,
-    requestedAt: row.requested_at,
-  }));
-
-  res.json({
-    today,
-    isSkipDay: holidays,
-    friends,
-    incoming,
-    outgoing,
-    counts: {
-      friends: friends.length,
-      incoming: incoming.length,
-      outgoing: outgoing.length,
-    },
-  });
-});
-
-/* ------------------------------- 催打卡 ---------------------------------- */
-
-app.post('/api/nudge/:username', authRequired, (req, res) => {
-  const me = freshUser(req.user);
-  const username = String(req.params.username || '').trim();
-  const target = q.userByName.get(username);
-
-  if (!target) return publicError(res, 404, 'USER_NOT_FOUND', '对方不存在');
-  if (target.id === me.id) return publicError(res, 400, 'CANNOT_NUDGE_SELF', '不用催自己啦');
-
-  // 核心权限校验：必须是 accepted 好友
-  if (friendshipState(me.id, target.id) !== 'accepted') {
-    return publicError(res, 403, 'NOT_FRIENDS', '只能催自己的好友，先加个好友吧');
-  }
-
-  const now = new Date();
-  const today = dateKey(now);
-  const nowMin = minutesOfDay(now);
-
-  if (isSkipDate(today)) {
-    return publicError(res, 400, 'SKIP_DAY', '今天是免打卡日，不用催啦');
-  }
-
-  const targetStatus = todayStatusFor(target, today, effectiveDeadline(target), nowMin);
-  if (targetStatus === 'done' || targetStatus === 'late') {
-    return publicError(res, 400, 'ALREADY_CHECKED_IN', '对方今天已经打卡了，放过他吧');
-  }
-
-  const last = q.lastNudgeBetween.get(me.id, target.id);
-  if (last) {
-    const elapsed = now.getTime() - new Date(last.created_at).getTime();
-    if (elapsed < NUDGE_COOLDOWN_MS) {
-      const retryAfter = Math.ceil((NUDGE_COOLDOWN_MS - elapsed) / 1000);
-      return publicError(res, 429, 'NUDGE_TOO_OFTEN', '催得太频繁了，歇一会儿再催', {
-        retryAfter,
-      });
-    }
-  }
-
-  q.insertNudge.run(me.id, target.id, today, now.toISOString());
-
-  console.log(`[nudge] ${me.username} -> ${target.username} (${today})`);
+  console.log(`[shop] ${user.username} 兑换补签卡 x${quantity}`);
 
   res.status(201).json({
     ok: true,
-    message: `已催 ${target.username} 打卡，快去写吧！`,
-    nudge: {
-      from: me.username,
-      to: target.username,
-      createdAt: now.toISOString(),
-      date: today,
-    },
+    quantity,
+    cost,
+    points: user.points,
+    makeupCards: user.makeup_cards,
   });
 });
 
@@ -1204,39 +1631,39 @@ app.post('/api/nudge/:username', authRequired, (req, res) => {
 
 app.get('/api/user/calendar', authRequired, (req, res) => {
   const user = freshUser(req.user);
-  const days = Math.min(
-    CALENDAR_MAX_DAYS,
-    Math.max(7, Number.parseInt(req.query.days, 10) || 30)
-  );
+  const days = Math.min(CALENDAR_MAX_DAYS, Math.max(7, Number.parseInt(req.query.days, 10) || 30));
 
   const now = new Date();
   const today = dateKey(now);
   const nowMin = minutesOfDay(now);
-  const deadline = effectiveDeadline(user);
-  const passed = nowMin >= hhmmToMinutes(deadline);
+  const habits = q.habitsByUser.all(user.id);
 
   const items = [];
-  const summary = { done: 0, excused: 0, missed: 0, holiday: 0, pending: 0 };
+  const summary = { done: 0, excused: 0, missed: 0, holiday: 0, rest: 0, pending: 0 };
 
   for (let offset = days - 1; offset >= 0; offset -= 1) {
     const date = addDays(today, -offset);
-    const checkin = q.checkinOn.get(user.id, date);
+    const active = habits.filter((h) => isActiveOn(h, date));
+    const checkins = active.map((h) => q.checkinOn.get(h.id, date)).filter(Boolean);
     const excuse = q.excuseOn.get(user.id, date);
 
     let status;
-    if (checkin) status = 'done';
+    if (isSkipDate(date)) status = 'holiday';
+    else if (!active.length) status = 'rest';
+    else if (checkins.length === active.length) status = 'done';
     else if (excuse) status = 'excused';
-    else if (isSkipDate(date)) status = 'holiday';
-    else if (date === today && !passed) status = 'pending';
+    else if (date === today && active.some((h) => nowMin < hhmmToMinutes(h.deadline_time))) status = 'pending';
     else status = 'missed';
 
     summary[status] += 1;
     items.push({
       date,
       status,
-      late: Boolean(checkin && checkin.late === 1),
+      late: checkins.some((c) => c.late === 1),
       isToday: date === today,
       weekday: weekdayIndex(date),
+      doneCount: checkins.length,
+      totalCount: active.length,
     });
   }
 
@@ -1255,7 +1682,7 @@ app.get('/api/user/calendar', authRequired, (req, res) => {
 app.get('/api/settings', authRequired, (req, res) => {
   const today = dateKey();
   res.json({
-    deadline: effectiveDeadline(req.user),
+    deadline: req.user.deadline || defaultDeadline(),
     userDeadline: req.user.deadline,
     defaultDeadline: defaultDeadline(),
     timezone: BUSINESS_TIMEZONE,
@@ -1263,36 +1690,24 @@ app.get('/api/settings', authRequired, (req, res) => {
     excuseLookbackDays: EXCUSE_LOOKBACK_DAYS,
     skipDates: Array.from(skipDates()).sort(),
     isSkipToday: isSkipDate(today),
+    leavePerMonth: LEAVE_PER_MONTH,
+    makeupCardCost: MAKEUP_CARD_COST,
+    pointsPerCheckin: POINTS_PER_CHECKIN,
+    pointsPerBreak: POINTS_PER_BREAK,
   });
 });
 
 app.put('/api/settings', authRequired, (req, res) => {
-  const body = req.body || {};
-  const raw = body.deadline;
-
+  const raw = (req.body || {}).deadline;
   if (raw === null || raw === '' || raw === 'default') {
     q.updateUserDeadline.run(null, nowIso(), req.user.id);
-    return res.json({
-      ok: true,
-      deadline: defaultDeadline(),
-      userDeadline: null,
-      defaultDeadline: defaultDeadline(),
-      timezone: BUSINESS_TIMEZONE,
-    });
+    return res.json({ ok: true, deadline: defaultDeadline(), userDeadline: null });
   }
-
   if (typeof raw !== 'string' || !TIME_RE.test(raw)) {
     return publicError(res, 400, 'INVALID_DEADLINE', '截止时间格式应为 HH:MM（00:00 - 23:59）');
   }
-
   q.updateUserDeadline.run(raw, nowIso(), req.user.id);
-  res.json({
-    ok: true,
-    deadline: raw,
-    userDeadline: raw,
-    defaultDeadline: defaultDeadline(),
-    timezone: BUSINESS_TIMEZONE,
-  });
+  res.json({ ok: true, deadline: raw, userDeadline: raw });
 });
 
 /* --------------------------- 账号自助修改 -------------------------------- */
@@ -1306,7 +1721,6 @@ app.put('/api/account', authRequired, (req, res) => {
   if (!wantsUsername && !wantsPassword) {
     return publicError(res, 400, 'INVALID_INPUT', '没有需要修改的内容');
   }
-
   if (wantsPassword && !verifyPassword(String(body.currentPassword || ''), user.password_hash)) {
     return publicError(res, 403, 'BAD_CURRENT_PASSWORD', '当前密码不正确');
   }
@@ -1315,24 +1729,18 @@ app.put('/api/account', authRequired, (req, res) => {
     if (wantsUsername) {
       const name = body.username.trim();
       if (!USERNAME_RE.test(name)) {
-        throw Object.assign(new Error('用户名需为 2-24 位字母、数字、下划线或中文'), {
-          status: 400,
-          code: 'INVALID_INPUT',
-        });
+        throw Object.assign(new Error('用户名需为 2-24 位字母、数字、下划线或中文'), { status: 400 });
       }
       const taken = q.userByName.get(name);
       if (taken && taken.id !== user.id) {
-        throw Object.assign(new Error('该用户名已被占用'), { status: 409, code: 'USERNAME_TAKEN' });
+        throw Object.assign(new Error('该用户名已被占用'), { status: 409 });
       }
       q.updateUsername.run(name, nowIso(), user.id);
       user.username = name;
     }
     if (wantsPassword) {
       if (String(body.password).length < 6 || String(body.password).length > 72) {
-        throw Object.assign(new Error('密码长度需为 6-72 位'), {
-          status: 400,
-          code: 'INVALID_INPUT',
-        });
+        throw Object.assign(new Error('密码长度需为 6-72 位'), { status: 400 });
       }
       q.updatePassword.run(hashPassword(body.password), nowIso(), user.id);
     }
@@ -1341,7 +1749,7 @@ app.put('/api/account', authRequired, (req, res) => {
   try {
     tx();
   } catch (err) {
-    return publicError(res, err.status || 400, err.code || 'INVALID_INPUT', err.message);
+    return publicError(res, err.status || 400, 'INVALID_INPUT', err.message);
   }
 
   res.json({ ok: true, token: signToken(user), user: serializeUser(user) });
@@ -1356,10 +1764,10 @@ app.get('/api/admin/users', authRequired, adminRequired, (req, res) => {
 
   const users = q.allUsers.all().map((user) => {
     settleUser(user, today);
+    refreshUser(user);
     return {
       ...serializeUser(user),
-      todayStatus: todayStatusFor(user, today, effectiveDeadline(user), nowMin),
-      totalCheckins: q.countCheckins.get(user.id).n,
+      todayStatus: todayStatusOf(user, today, nowMin),
     };
   });
 
@@ -1367,48 +1775,27 @@ app.get('/api/admin/users', authRequired, adminRequired, (req, res) => {
 });
 
 app.post('/api/admin/users/:id/reset', authRequired, adminRequired, (req, res) => {
-  const targetId = Number(req.params.id);
-  const target = Number.isInteger(targetId) ? q.userById.get(targetId) : null;
+  const target = q.userById.get(Number(req.params.id));
   if (!target) return publicError(res, 404, 'USER_NOT_FOUND', '用户不存在');
 
-  const today = dateKey();
-  const body = req.body || {};
-  const date = body.date ? String(body.date) : today;
-  if (!DATE_RE.test(date)) {
-    return publicError(res, 400, 'INVALID_DATE', '日期格式应为 YYYY-MM-DD');
-  }
-  const resetStreak = body.resetStreak !== false;
+  const date = (req.body || {}).date ? String(req.body.date) : dateKey();
+  if (!DATE_RE.test(date)) return publicError(res, 400, 'INVALID_DATE', '日期格式应为 YYYY-MM-DD');
 
   const tx = db.transaction(() => {
-    q.deleteCheckinOn.run(target.id, date);
+    q.deleteCheckinsOn.run(target.id, date);
     q.deleteExcuseOn.run(target.id, date);
-    if (resetStreak) {
-      q.updateUserStreak.run(0, null, nowIso(), target.id);
-      target.current_streak = 0;
-      target.last_counted_date = null;
-    }
-    q.audit.run(
-      req.user.id,
-      'RESET_CHECKIN',
-      target.id,
-      JSON.stringify({ date, resetStreak }),
-      nowIso()
-    );
+    db.prepare(
+      'UPDATE habits SET current_streak = 0, last_counted_date = NULL, updated_at = ? WHERE user_id = ?'
+    ).run(nowIso(), target.id);
+    q.syncUserStreak.run(0, target.best_streak, null, nowIso(), target.id);
+    q.audit.run(req.user.id, 'RESET_CHECKIN', target.id, JSON.stringify({ date }), nowIso());
   });
   tx();
 
-  console.log(`[admin] ${req.user.username} 重置了 ${target.username} 的 ${date} 记录`);
-
   const refreshed = q.userById.get(target.id);
-  res.json({
-    ok: true,
-    date,
-    user: serializeUser(refreshed),
-    status: buildStatus(refreshed),
-  });
+  res.json({ ok: true, date, user: serializeUser(refreshed), status: buildStatus(refreshed) });
 });
 
-/** 管理员：更新全局设置（默认截止时间 / 免打卡日） */
 app.put('/api/admin/settings', authRequired, adminRequired, (req, res) => {
   const body = req.body || {};
   const patch = {};
@@ -1419,7 +1806,6 @@ app.put('/api/admin/settings', authRequired, adminRequired, (req, res) => {
     }
     patch.default_deadline = String(body.defaultDeadline);
   }
-
   if (body.skipDates !== undefined) {
     const normalized = normalizeSkipDates(body.skipDates);
     if (normalized === null) {
@@ -1427,7 +1813,6 @@ app.put('/api/admin/settings', authRequired, adminRequired, (req, res) => {
     }
     patch.skip_dates = normalized.join(',');
   }
-
   if (!Object.keys(patch).length) {
     return publicError(res, 400, 'INVALID_INPUT', '没有需要修改的设置');
   }
@@ -1439,38 +1824,21 @@ app.put('/api/admin/settings', authRequired, adminRequired, (req, res) => {
   res.json({
     ok: true,
     defaultDeadline: defaultDeadline(),
-    timezone: BUSINESS_TIMEZONE,
     skipDates: Array.from(skipDates()).sort(),
     isSkipToday: isSkipDate(dateKey()),
   });
 });
 
-/** 管理员：只设置免打卡日（App/Web 表单专用） */
 app.post('/api/admin/set-skip-dates', authRequired, adminRequired, (req, res) => {
   const normalized = normalizeSkipDates((req.body || {}).dates);
   if (normalized === null) {
-    return publicError(
-      res,
-      400,
-      'INVALID_SKIP_DATES',
-      '免打卡日格式应为 YYYY-MM-DD，多个用逗号或换行分隔'
-    );
+    return publicError(res, 400, 'INVALID_SKIP_DATES', '免打卡日格式应为 YYYY-MM-DD，多个用逗号或换行分隔');
   }
-
   const saved = setSkipDates(normalized);
   q.audit.run(req.user.id, 'SET_SKIP_DATES', null, JSON.stringify(saved), nowIso());
-
-  console.log(`[admin] ${req.user.username} 更新免打卡日：${saved.join(',') || '（空）'}`);
-
-  res.json({
-    ok: true,
-    skipDates: saved,
-    count: saved.length,
-    isSkipToday: isSkipDate(dateKey()),
-  });
+  res.json({ ok: true, skipDates: saved, count: saved.length, isSkipToday: isSkipDate(dateKey()) });
 });
 
-/** 把 "2026-12-25,2027-01-01" / 数组 / 换行文本 统一成有序去重数组；非法返回 null */
 function normalizeSkipDates(input) {
   if (input === undefined || input === null) return [];
   let pieces;
@@ -1490,6 +1858,154 @@ function normalizeSkipDates(input) {
   return Array.from(out).sort();
 }
 
+/* ------------------------------- 好友 ------------------------------------ */
+
+function resolveBodyUser(body) {
+  const payload = body || {};
+  if (payload.userId !== undefined && payload.userId !== null) {
+    const id = Number(payload.userId);
+    return Number.isInteger(id) ? q.userById.get(id) || null : null;
+  }
+  if (typeof payload.username === 'string' && payload.username.trim()) {
+    return q.userByName.get(payload.username.trim()) || null;
+  }
+  return null;
+}
+
+app.post('/api/friends/request', authRequired, (req, res) => {
+  const me = req.user;
+  const target = resolveBodyUser(req.body);
+  if (!target) return publicError(res, 404, 'USER_NOT_FOUND', '对方不存在');
+  if (target.id === me.id) return publicError(res, 400, 'CANNOT_FRIEND_SELF', '不能加自己为好友');
+
+  const state = friendshipState(me.id, target.id);
+  if (state === 'accepted') return publicError(res, 409, 'ALREADY_FRIENDS', '你们已经是好友了');
+  if (state === 'pending_out') {
+    return publicError(res, 409, 'REQUEST_EXISTS', '好友申请已发送，等待对方同意');
+  }
+
+  const now = nowIso();
+  const autoAccepted = state === 'pending_in';
+  const tx = db.transaction(() => {
+    if (autoAccepted) {
+      q.upsertFriendship.run(me.id, target.id, 'accepted', now, now);
+      q.upsertFriendship.run(target.id, me.id, 'accepted', now, now);
+    } else {
+      q.upsertFriendship.run(me.id, target.id, 'pending', now, now);
+    }
+  });
+  tx();
+
+  res.status(autoAccepted ? 200 : 201).json({
+    ok: true,
+    autoAccepted,
+    status: autoAccepted ? 'accepted' : 'pending_out',
+    friend: { id: target.id, username: target.username },
+  });
+});
+
+app.post('/api/friends/accept', authRequired, (req, res) => {
+  const me = req.user;
+  const requester = resolveBodyUser(req.body);
+  if (!requester) return publicError(res, 404, 'USER_NOT_FOUND', '申请人不存在');
+
+  const pending = q.friendshipOne.get(requester.id, me.id);
+  if (!pending || pending.status !== 'pending') {
+    return publicError(res, 404, 'NO_PENDING_REQUEST', '没有待处理的好友申请');
+  }
+
+  const now = nowIso();
+  const tx = db.transaction(() => {
+    q.upsertFriendship.run(requester.id, me.id, 'accepted', now, now);
+    q.upsertFriendship.run(me.id, requester.id, 'accepted', now, now);
+  });
+  tx();
+
+  res.json({ ok: true, friend: { id: requester.id, username: requester.username }, state: 'accepted' });
+});
+
+app.get('/api/friends/list', authRequired, (req, res) => {
+  const me = freshUser(req.user);
+  const today = dateKey();
+  const nowMin = minutesOfDay();
+  const holiday = isSkipDate(today);
+
+  const friends = q.acceptedFriends.all(me.id).map((row) => {
+    settleUser(row, today);
+    const todayStatus = todayStatusOf(row, today, nowMin);
+    const checkedInToday = todayStatus === 'done' || todayStatus === 'late';
+    return {
+      id: row.id,
+      username: row.username,
+      streak: q.maxStreak.get(row.id).n,
+      bestStreak: q.maxBestStreak.get(row.id).n,
+      todayStatus,
+      checkedInToday,
+      since: row.friends_since,
+      canNudge: !checkedInToday && !holiday && todayStatus !== 'excused' && todayStatus !== 'rest',
+    };
+  });
+
+  friends.sort((a, b) => b.streak - a.streak);
+
+  const incoming = q.incomingRequests.all(me.id).map((row) => ({
+    id: row.id,
+    username: row.username,
+    requestedAt: row.requested_at,
+  }));
+  const outgoing = q.outgoingRequests.all(me.id).map((row) => ({
+    id: row.id,
+    username: row.username,
+    requestedAt: row.requested_at,
+  }));
+
+  res.json({
+    today,
+    isSkipDay: holiday,
+    friends,
+    incoming,
+    outgoing,
+    counts: { friends: friends.length, incoming: incoming.length, outgoing: outgoing.length },
+  });
+});
+
+app.post('/api/nudge/:username', authRequired, (req, res) => {
+  const me = freshUser(req.user);
+  const target = q.userByName.get(String(req.params.username || '').trim());
+  if (!target) return publicError(res, 404, 'USER_NOT_FOUND', '对方不存在');
+  if (target.id === me.id) return publicError(res, 400, 'CANNOT_NUDGE_SELF', '不用催自己啦');
+
+  if (friendshipState(me.id, target.id) !== 'accepted') {
+    return publicError(res, 403, 'NOT_FRIENDS', '只能催自己的好友，先加个好友吧');
+  }
+
+  const now = new Date();
+  const today = dateKey(now);
+  if (isSkipDate(today)) return publicError(res, 400, 'SKIP_DAY', '今天是免打卡日，不用催啦');
+
+  const targetStatus = todayStatusOf(target, today, minutesOfDay(now));
+  if (targetStatus === 'done' || targetStatus === 'late') {
+    return publicError(res, 400, 'ALREADY_CHECKED_IN', '对方今天已经打卡了，放过他吧');
+  }
+
+  const last = q.lastNudgeBetween.get(me.id, target.id);
+  if (last) {
+    const elapsed = now.getTime() - new Date(last.created_at).getTime();
+    if (elapsed < NUDGE_COOLDOWN_MS) {
+      return publicError(res, 429, 'NUDGE_TOO_OFTEN', '催得太频繁了，歇一会儿再催', {
+        retryAfter: Math.ceil((NUDGE_COOLDOWN_MS - elapsed) / 1000),
+      });
+    }
+  }
+
+  q.insertNudge.run(me.id, target.id, today, now.toISOString());
+  res.status(201).json({
+    ok: true,
+    message: `已催 ${target.username} 打卡，快去写吧！`,
+    nudge: { from: me.username, to: target.username, createdAt: now.toISOString(), date: today },
+  });
+});
+
 /* ------------------------------- 静态资源 -------------------------------- */
 
 app.use(
@@ -1497,7 +2013,6 @@ app.use(
     extensions: ['html'],
     maxAge: '1h',
     setHeaders(res, filePath) {
-      // 页面与接口相关资源不缓存，保证更新后刷新即可看到新版
       if (filePath.endsWith('index.html')) res.setHeader('Cache-Control', 'no-cache');
     },
   })
@@ -1510,8 +2025,6 @@ app.get('/', (req, res) => {
 app.use('/api', (req, res) => {
   publicError(res, 404, 'NOT_FOUND', '接口不存在');
 });
-
-/* ------------------------------- 错误处理 -------------------------------- */
 
 app.use((err, req, res, next) => {
   if (err && err.type === 'entity.parse.failed') {
@@ -1526,20 +2039,21 @@ app.use((err, req, res, next) => {
 });
 
 /* --------------------------------------------------------------------------
- * 10. 启动
+ * 16. 启动
  * ------------------------------------------------------------------------ */
 
 seed();
+for (const user of q.allUsers.all()) ensureDefaultHabit(user, defaultDeadline());
 
 const server = app.listen(PORT, HOST, () => {
   console.log('──────────────────────────────────────────────');
-  console.log('  不拖延 · 强制打卡系统 v2.0 已启动');
+  console.log('  不拖延 · 强制打卡系统 v3.0 已启动');
   console.log(`  HTTP       http://localhost:${PORT}`);
   console.log(`  Web 管理端 http://localhost:${PORT}/`);
   console.log(`  数据库     ${DB_PATH}`);
   console.log(`  时区       ${BUSINESS_TIMEZONE}（强制）`);
-  console.log(`  默认截止   ${defaultDeadline()}`);
-  console.log(`  免打卡日   ${Array.from(skipDates()).join(', ') || '（未设置）'}`);
+  console.log(`  积分规则   打卡 +${POINTS_PER_CHECKIN} / 断签 -${POINTS_PER_BREAK} / 补签卡 ${MAKEUP_CARD_COST} 分`);
+  console.log(`  请假额度   每月 ${LEAVE_PER_MONTH} 次`);
   console.log(`  环境       ${NODE_ENV}`);
   console.log('──────────────────────────────────────────────');
 });

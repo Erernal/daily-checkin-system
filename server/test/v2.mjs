@@ -181,7 +181,7 @@ async function main() {
   /* ---------------------------- 周期榜 ---------------------------- */
   console.log('\n[3] 排行榜周期切换');
   const boardAll = await call('GET', '/api/leaderboard?period=all', { token: u1.token });
-  check('总榜 period=all', boardAll.data.period === 'all' && boardAll.data.periodLabel === '总榜', boardAll.data.periodLabel);
+  check('总榜 type=streak', boardAll.data.type === 'streak' && boardAll.data.typeLabel === '连胜榜', boardAll.data.typeLabel);
   check('总榜 score=连胜', boardAll.data.rows.every((r) => r.score === r.streak), boardAll.data.rows.map((r) => [r.score, r.streak]));
   check('行内包含好友关系字段', boardAll.data.rows.every((r) => typeof r.friendship === 'string'), boardAll.data.rows[0]);
   check('好友行 friendship=accepted', boardAll.data.rows.find((r) => r.username === u2.name).friendship === 'accepted', boardAll.data.rows);
@@ -195,7 +195,7 @@ async function main() {
   check('月榜起点为当月 1 号', boardMonth.data.range.start.endsWith('-01'), boardMonth.data.range);
 
   const boardBad = await call('GET', '/api/leaderboard?period=decade', { token: u1.token });
-  check('非法 period 回落总榜', boardBad.data.period === 'all', boardBad.data.period);
+  check('非法 period 回落连胜榜', boardBad.data.type === 'streak', boardBad.data.type);
 
   check('排行榜按分数降序', boardWeek.data.rows.every((r, i, arr) => i === 0 || arr[i - 1].score >= r.score), boardWeek.data.rows.map((r) => r.score));
 
@@ -254,11 +254,10 @@ async function main() {
   const freezeName = `freeze_${suffix}`;
   const freeze = await register(freezeName);
 
-  // 伪造：用户两天前打过卡，昨天是免打卡日，今天打开 App
-  db.prepare('UPDATE users SET current_streak = 5, best_streak = 5, last_counted_date = ? WHERE id = ?').run(
-    addDays(today, -2),
-    freeze.id
-  );
+  // 伪造：用户两天前打过卡，昨天是免打卡日，今天打开 App（v3：状态在 habits 表上）
+  db.prepare(
+    'UPDATE habits SET current_streak = 5, best_streak = 5, last_counted_date = ?, start_date = ? WHERE user_id = ?'
+  ).run(addDays(today, -2), addDays(today, -30), freeze.id);
   db.prepare('DELETE FROM checkins WHERE user_id = ?').run(freeze.id);
 
   await call('POST', '/api/admin/set-skip-dates', {
@@ -270,15 +269,14 @@ async function main() {
   check('昨天是免打卡日 → 连胜不被清零', frozenStatus.data.streak === 5, frozenStatus.data.streak);
   check('今天不是免打卡日 → 状态正常', frozenStatus.data.isSkipDay === false, frozenStatus.data.status);
 
-  const marker = db.prepare('SELECT last_counted_date FROM users WHERE id = ?').get(freeze.id);
-  check('结算标记推进到昨天', marker.last_counted_date === addDays(today, -1), marker);
+  const marker = db.prepare('SELECT MAX(last_counted_date) AS d FROM habits WHERE user_id = ?').get(freeze.id);
+  check('结算标记推进到昨天', marker.d === addDays(today, -1), marker);
 
   // 对照组：没有免打卡日时同样的数据会断签
   await call('POST', '/api/admin/set-skip-dates', { token: adminToken, body: { dates: [] } });
-  db.prepare('UPDATE users SET current_streak = 5, last_counted_date = ? WHERE id = ?').run(
-    addDays(today, -2),
-    freeze.id
-  );
+  db.prepare(
+    'UPDATE habits SET current_streak = 5, last_counted_date = ?, start_date = ? WHERE user_id = ?'
+  ).run(addDays(today, -2), addDays(today, -30), freeze.id);
   const brokenStatus = await call('GET', '/api/status', { token: freeze.token });
   check('无免打卡日 → 断签清零', brokenStatus.data.streak === 0, brokenStatus.data.streak);
 

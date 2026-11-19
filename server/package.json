@@ -1,8 +1,8 @@
 {
   "name": "qiangzhi-checkin-server",
-  "version": "2.0.0",
+  "version": "3.0.0",
   "private": true,
-  "description": "防拖延强制打卡系统 v2 - 好友/催打卡/免打卡日/周期榜",
+  "description": "防拖延强制打卡系统 v3 - 多习惯/休息日/积分/三榜",
   "main": "server.js",
   "engines": {
     "node": ">=18.17"
@@ -12,7 +12,8 @@
     "dev": "node --watch server.js",
     "smoke": "node test/smoke.mjs",
     "seed:demo": "node scripts/seed-demo.mjs",
-    "test:v2": "node test/v2.mjs"
+    "test:v2": "node test/v2.mjs",
+    "test:v3": "node test/v3.mjs"
   },
   "pnpm": {
     "onlyBuiltDependencies": [

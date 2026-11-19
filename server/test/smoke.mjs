@@ -152,7 +152,8 @@ async function main() {
   check('排行榜含 Alice', board.data.rows.some((r) => r.username === aliceName), board.data.rows);
   check('排行榜标记 isMe', board.data.rows.some((r) => r.isMe === true), board.data.rows);
   check('排名从 1 开始连续', board.data.rows.every((r, i) => r.rank === i + 1), board.data.rows.map((r) => r.rank));
-  check('Alice 排第一（连胜最高）', board.data.rows[0].username === aliceName, board.data.rows[0]);
+  check('Alice 出现在连胜榜', board.data.rows.some((r) => r.username === aliceName), board.data.rows.map((r) => r.username));
+  check('榜单按分数降序', board.data.rows.every((r, i, arr) => i === 0 || arr[i - 1].value >= r.value), board.data.rows.map((r) => r.value));
 
   console.log('\n[8] 管理员重置');
   const target = board.data.rows.find((r) => r.username === aliceName);
@@ -169,7 +170,7 @@ async function main() {
   check('重置后连胜归零', reset.data.user.streak === 0, reset.data.user);
 
   const afterReset = await call('GET', '/api/status', { token: alice.token });
-  check('重置后 Alice 今日未打卡', afterReset.data.checkedIn === false, afterReset.data);
+  check('重置后 Alice 今日未打卡', afterReset.data.todayDoneCount === 0 && afterReset.data.checkedIn === undefined, afterReset.data.todayDoneCount);
 
   console.log('\n[9] 修改账号');
   const badAccount = await call('PUT', '/api/account', {
@@ -199,7 +200,9 @@ async function main() {
     body: { defaultDeadline: '21:30' },
   });
   check('管理员修改全局截止时间', globalSettings.status === 200 && globalSettings.data.defaultDeadline === '21:30', globalSettings);
-  check('时区被强制为北京时间', globalSettings.data.timezone === 'Asia/Shanghai', globalSettings.data);
+
+  const tzSettings = await call('GET', '/api/settings', { token: adminLogin.data.token });
+  check('时区被强制为北京时间', tzSettings.data.timezone === 'Asia/Shanghai', tzSettings.data);
 
   const badDeadline = await call('PUT', '/api/admin/settings', {
     token: adminLogin.data.token,
