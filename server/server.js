@@ -201,11 +201,22 @@ db.exec(`
     created_at   TEXT    NOT NULL
   );
 
+  /* 设备登录记录：只记录不拦截，用于注册时判断“这台设备是否已经用过” */
+  CREATE TABLE IF NOT EXISTS device_logins (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id       INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    device_id     TEXT    NOT NULL,
+    first_seen_at TEXT    NOT NULL,
+    last_seen_at  TEXT    NOT NULL,
+    UNIQUE (user_id, device_id)
+  );
+
   CREATE INDEX IF NOT EXISTS idx_checkins_user_date  ON checkins (user_id, date);
   CREATE INDEX IF NOT EXISTS idx_excuses_user_date   ON excuses (user_id, date);
   CREATE INDEX IF NOT EXISTS idx_friends_user        ON friends (user_id, status);
   CREATE INDEX IF NOT EXISTS idx_friends_friend      ON friends (friend_id, status);
   CREATE INDEX IF NOT EXISTS idx_nudges_to_date      ON nudges (to_user_id, date);
+  CREATE INDEX IF NOT EXISTS idx_device_logins_device ON device_logins (device_id);
   CREATE INDEX IF NOT EXISTS idx_habits_user         ON habits (user_id, archived);
 `);
 
@@ -222,9 +233,10 @@ function migrate() {
   ensureColumn('users', 'leave_month', 'leave_month TEXT');
   ensureColumn('users', 'makeup_cards', 'makeup_cards INTEGER NOT NULL DEFAULT 0');
 
-  db.exec(
-    'CREATE UNIQUE INDEX IF NOT EXISTS idx_users_device ON users (device_id) WHERE device_id IS NOT NULL'
-  );
+  // 设备号不再做数据库级唯一约束：登录换机要能静默更新；
+  // 防小号靠注册时查 device_logins / users.device_id。
+  db.exec('DROP INDEX IF EXISTS idx_users_device');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_users_device ON users (device_id)');
 
   // excuses 是否消耗请假额度
   ensureColumn('excuses', 'uses_leave', 'uses_leave INTEGER NOT NULL DEFAULT 1');
@@ -302,6 +314,13 @@ const q = {
   userById: db.prepare('SELECT * FROM users WHERE id = ?'),
   userByName: db.prepare('SELECT * FROM users WHERE username = ? COLLATE NOCASE'),
   userByDevice: db.prepare('SELECT * FROM users WHERE device_id = ?'),
+  deviceLoginByDevice: db.prepare('SELECT user_id FROM device_logins WHERE device_id = ? LIMIT 1'),
+  upsertDeviceLogin: db.prepare(`
+    INSERT INTO device_logins (user_id, device_id, first_seen_at, last_seen_at)
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT(user_id, device_id)
+    DO UPDATE SET last_seen_at = excluded.last_seen_at
+  `),
   allUsers: db.prepare('SELECT * FROM users ORDER BY id ASC'),
   insertUser: db.prepare(`
     INSERT INTO users (username, password_hash, is_admin, device_id, points, leave_balance, leave_month, created_at, updated_at)
@@ -1173,6 +1192,27 @@ function normalizeDeviceId(value) {
   return trimmed;
 }
 
+/**
+ * 记录一次设备使用（注册 / 登录都会调用）：
+ *  · device_logins 记录「哪台设备用过哪个账号」，注册时用来防小号；
+ *  · 登录时静默把 users.device_id 更新为当前设备，不做任何拦截。
+ */
+function recordDevice(user, deviceId) {
+  if (!deviceId) return;
+  const now = nowIso();
+  q.upsertDeviceLogin.run(user.id, deviceId, now, now);
+  if (user.device_id !== deviceId) {
+    q.updateDevice.run(deviceId, now, user.id);
+    user.device_id = deviceId;
+  }
+}
+
+/** 这台设备是否已经绑定过账号（注册防小号用） */
+function isDeviceTaken(deviceId) {
+  if (!deviceId) return false;
+  return Boolean(q.userByDevice.get(deviceId) || q.deviceLoginByDevice.get(deviceId));
+}
+
 app.post('/api/register', (req, res) => {
   const ip = req.ip || 'unknown';
   if (!rateLimit({ key: `reg:${ip}`, limit: 20, windowMs: 3600_000 })) {
@@ -1191,8 +1231,8 @@ app.post('/api/register', (req, res) => {
   if (body.deviceId && !deviceId) {
     return publicError(res, 400, 'INVALID_DEVICE', '设备标识格式不正确');
   }
-  if (deviceId && q.userByDevice.get(deviceId)) {
-    return publicError(res, 409, 'DEVICE_TAKEN', '该设备已注册过账号，请直接登录');
+  if (isDeviceTaken(deviceId)) {
+    return publicError(res, 409, 'DEVICE_TAKEN', '该设备已绑定过账号，请直接登录');
   }
 
   const now = nowIso();
@@ -1208,6 +1248,7 @@ app.post('/api/register', (req, res) => {
   );
   const user = q.userById.get(info.lastInsertRowid);
   ensureDefaultHabit(user, defaultDeadline());
+  recordDevice(user, deviceId);
 
   console.log(`[auth] 新用户注册：${user.username} (#${user.id})`);
   res.status(201).json({ token: signToken(user), user: serializeUser(user) });
@@ -1230,13 +1271,9 @@ app.post('/api/login', (req, res) => {
     return publicError(res, 401, 'BAD_CREDENTIALS', '用户名或密码错误');
   }
 
+  // 换设备登录不拦截：只记录新设备并静默更新 users.device_id
   const deviceId = normalizeDeviceId(body.deviceId);
-  if (deviceId) {
-    if (user.device_id && user.device_id !== deviceId) {
-      return publicError(res, 403, 'DEVICE_MISMATCH', '该账号已绑定其他设备，请联系管理员解绑');
-    }
-    if (!user.device_id) q.updateDevice.run(deviceId, nowIso(), user.id);
-  }
+  if (deviceId) recordDevice(user, deviceId);
 
   ensureLeaveMonth(user);
   settleUser(user, dateKey());

@@ -85,10 +85,19 @@ async function main() {
   });
   check('同一设备重复注册 409', dup.status === 409 && dup.data.error === 'DEVICE_TAKEN', dup.data);
 
-  const badDevice = await call('POST', '/api/login', {
-    body: { username: u1.name, password: 'secret123', deviceId: 'other-device-9999' },
+  const newDevice = `dev-new-${suffix}-bbbb`;
+  const deviceLogin = await call('POST', '/api/login', {
+    body: { username: u1.name, password: 'secret123', deviceId: newDevice },
   });
-  check('换设备登录被拒绝 403', badDevice.status === 403 && badDevice.data.error === 'DEVICE_MISMATCH', badDevice.data);
+  check('换设备登录不再拦截 200', deviceLogin.status === 200, deviceLogin.data);
+
+  const bound = db.prepare('SELECT device_id FROM users WHERE id = ?').get(u1.id);
+  check('已静默更新 users.device_id', bound.device_id === newDevice, bound);
+
+  const altAccount = await call('POST', '/api/register', {
+    body: { username: `v3alt_${suffix}`, password: 'secret123', deviceId: newDevice },
+  });
+  check('用过的设备不能注册小号 409', altAccount.status === 409 && altAccount.data.error === 'DEVICE_TAKEN', altAccount.data);
 
   /* ---------------- 模块一：习惯 CRUD ---------------- */
   console.log('\n[2] 习惯创建 / 编辑 / 星期配置');

@@ -18,7 +18,7 @@ Web 管理端 + 移动 App + 统一后端。**多习惯**打卡：每个习惯�
 | 二、结算与通知 | `settleHabit()` 只结算 `active_days` 内的日子；App 用 **weekly** 触发器按每个习惯的生效星期 + 截止前 15 分钟注册通知 |
 | 三、多榜 | `GET /api/leaderboard/streak\|total\|points`；两端三 Tab |
 | 四、Web 管理 | 打卡按钮 `confirm()` 二次确认；游客可不登录只读排行榜 |
-| 五、基础保障 | `users.device_id` 唯一索引；`leave_balance` 月初重置；积分/补签卡；勋章 🛡️👑；App 的 `API_BASE` 固定为 `http://39.96.213.95:3000` |
+| 五、基础保障 | 注册按 `device_logins` 防一机多号；`leave_balance` 月初重置；积分/补签卡；勋章 🛡️👑；App 的 `API_BASE` 固定为 `http://39.96.213.95:3000` |
 
 ---
 
@@ -96,7 +96,7 @@ npm run test:v3   # 48 条：习惯 / 休息日 / 积分 / 请假 / 补签 / 设
 | 补签卡 | 100 分兑换；结算发现漏签时自动消耗一张，记为「补签」：连胜保留、不扣分，且不计入总次数 |
 | 连胜 | 取该用户所有习惯中的最大连胜；枚举报：最佳 ≥7 天 🛡️，≥30 天 👑 |
 | 免打卡日 | 管理员设置的全员日期，不打卡不断签、不触发阻断 |
-| 设备唯一 | 注册可带 `deviceId`，同一设备重复注册 409；登录带不同设备 403 |
+| 设备 | 注册时同一设备只能开一个号（查 `device_logins` / `users.device_id`，409）；**登录不拦截**，换机登录会静默把 `users.device_id` 更新为新设备并记录到 `device_logins` |
 
 **强制阻断**（App 全屏遮罩）：今天有生效习惯已过截止仍未完成 / 昨天有生效习惯漏签，且未请假。
 
@@ -111,7 +111,7 @@ npm run test:v3   # 48 条：习惯 / 休息日 / 积分 / 请假 / 补签 / 设
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | POST | `/api/register` | `{username, password, deviceId?}` |
-| POST | `/api/login` | `{username, password, deviceId?}`，设备不匹配返回 403 |
+| POST | `/api/login` | `{username, password, deviceId?}`，换设备不拦截，只静默更新绑定 |
 | GET | `/api/status` | 今日聚合状态 + `habits[]` + 积分/额度/补签卡/勋章 |
 | GET | `/api/me` | 用户 + 状态 |
 
@@ -167,7 +167,7 @@ npm run test:v3   # 48 条：习惯 / 休息日 / 积分 / 请假 / 补签 / 设
 - 排行榜三榜切换，好友「加好友 / 同意 / 催一下」
 - 个人主页：30 天热力图（含休息日）、好友、勋章
 - 通知：按每个习惯的**生效星期**注册 `weekly` 通知，时间为截止前 15 分钟；休息日不会响
-- 登录/注册自动上报 `deviceId`（expo-device），一机一号
+- 登录/注册自动上报 `deviceId`（expo-device）：注册限一机一号，登录换机不受限
 
 ---
 
@@ -181,7 +181,7 @@ ALTER TABLE users ADD COLUMN points INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE users ADD COLUMN leave_balance INTEGER NOT NULL DEFAULT 3;
 ALTER TABLE users ADD COLUMN leave_month TEXT;
 ALTER TABLE users ADD COLUMN makeup_cards INTEGER NOT NULL DEFAULT 0;
-CREATE UNIQUE INDEX IF NOT EXISTS idx_users_device ON users (device_id) WHERE device_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_users_device ON users (device_id);
 
 CREATE TABLE IF NOT EXISTS habits (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -262,7 +262,7 @@ Nginx / HTTPS / 防火墙 / 备份同前，配置见 `deploy/`。
 - **打卡按钮灰色**：该习惯今天不在生效星期内（休息日），或已请假/免打卡日。
 - **积分变少**：昨天漏签被结算，-20；有补签卡会自动消耗避免扣分。
 - **请假没保住连胜**：本月 3 次额度用完了，接口返回 `usedLeave:false`。
-- **换手机登录报 403**：账号已绑定旧设备；联系管理员在数据库清空 `users.device_id`。
+- **换手机登录**：直接登录即可，服务端会静默更新设备号，不再报 403。
 - **通知不响**：检查通知权限；Android 需允许「闹钟和提醒」并关闭电池优化；休息日不会注册通知。
 - **时间对不上**：服务端与 App 都按北京时间计算，手机时区建议设为东八区。
 
@@ -270,4 +270,4 @@ Nginx / HTTPS / 防火墙 / 备份同前，配置见 `deploy/`。
 
 - 密码 scrypt 加盐；JWT 7 天；登录限流。
 - 生产环境必须设置 `JWT_SECRET` 与 `ADMIN_PASSWORD`，并启用 HTTPS。
-- `device_id` 唯一索引防止一机多号；催打卡有 403 好友校验 + 10 分钟冷却。
+- 注册按设备号防一机多号（`device_logins`），登录不拦截；催打卡有 403 好友校验 + 10 分钟冷却。

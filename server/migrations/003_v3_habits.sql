@@ -1,5 +1,5 @@
 -- ============================================================================
---  不拖延 · v2 → v3 数据库变更（多习惯 / 积分 / 请假额度 / 补签卡 / 设备唯一）
+--  不拖延 · v2 → v3 数据库变更（多习惯 / 积分 / 请假额度 / 补签卡 / 设备防小号）
 --  SQLite 说明：ALTER TABLE 一次只能 ADD COLUMN，且没有 IF NOT EXISTS；
 --  服务启动时会用 PRAGMA table_info 做幂等检查，重复执行也不会报错。
 --  手工执行：sqlite3 data/checkin.db < migrations/003_v3_habits.sql
@@ -12,8 +12,20 @@ ALTER TABLE users ADD COLUMN leave_balance INTEGER NOT NULL DEFAULT 3;
 ALTER TABLE users ADD COLUMN leave_month TEXT;                       -- 形如 2026-11，用于月初重置
 ALTER TABLE users ADD COLUMN makeup_cards INTEGER NOT NULL DEFAULT 0;
 
--- 设备号唯一（允许多个 NULL，即未绑定设备的老账号）
-CREATE UNIQUE INDEX IF NOT EXISTS idx_users_device ON users (device_id) WHERE device_id IS NOT NULL;
+-- 设备号：不做唯一约束（登录换机要静默更新）；防小号靠 device_logins
+DROP INDEX IF EXISTS idx_users_device;
+CREATE INDEX IF NOT EXISTS idx_users_device ON users (device_id);
+
+-- 设备使用记录：注册/登录都会写入，注册时据此判断“这台设备是否开过号”
+CREATE TABLE IF NOT EXISTS device_logins (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id       INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  device_id     TEXT    NOT NULL,
+  first_seen_at TEXT    NOT NULL,
+  last_seen_at  TEXT    NOT NULL,
+  UNIQUE (user_id, device_id)
+);
+CREATE INDEX IF NOT EXISTS idx_device_logins_device ON device_logins (device_id);
 
 -- ---------- 2. habits：打卡项与时间规则 ----------
 CREATE TABLE IF NOT EXISTS habits (
