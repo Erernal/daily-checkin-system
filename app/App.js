@@ -77,6 +77,7 @@ const STATUS_TEXT = {
   missed: '已漏签',
   holiday: '免打卡日',
   rest: '今日休息',
+  vacation: '休假中',
 };
 
 const STATUS_COLOR = {
@@ -88,6 +89,7 @@ const STATUS_COLOR = {
   missed: C.red,
   holiday: C.cyan,
   rest: C.muted,
+  vacation: C.purple,
 };
 
 const STATUS_BADGE = {
@@ -99,6 +101,7 @@ const STATUS_BADGE = {
   pending: '待打卡',
   holiday: '免打卡',
   rest: '休息',
+  vacation: '休假中',
 };
 
 /* ==========================================================================
@@ -576,8 +579,8 @@ function LoginScreen({ onLogin }) {
         <ScrollView contentContainerStyle={styles.loginWrap} keyboardShouldPersistTaps="handled">
           <View style={styles.loginHead}>
             <Text style={styles.loginLogo}>⏰</Text>
-            <Text style={styles.loginTitle}>不拖延</Text>
-            <Text style={styles.loginSub}>CHECK-IN OR EXCUSE</Text>
+            <Text style={styles.loginTitle}>拒绝摆烂</Text>
+            <Text style={styles.loginSub}>NOSLACK · CHECK-IN OR EXCUSE</Text>
           </View>
 
           <NeonCard style={{ padding: 20 }}>
@@ -1144,24 +1147,33 @@ const HEAT_COLORS = {
   missed: C.dim,
   holiday: C.cyan,
   rest: '#1B2230',
+  vacation: C.purple,
   pending: 'rgba(0,229,255,0.18)',
 };
 
 function ProfileScreen({ token, status, active, notify, onLogout }) {
   const [calendar, setCalendar] = useState(null);
   const [friends, setFriends] = useState(null);
+  const [vacations, setVacations] = useState([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [acting, setActing] = useState('');
+  const [confirm, setConfirm] = useState(null);
+  const [vacStart, setVacStart] = useState(beijingToday());
+  const [vacEnd, setVacEnd] = useState(beijingToday());
+  const [vacReason, setVacReason] = useState('');
+  const [vacBusy, setVacBusy] = useState(false);
 
   const load = useCallback(async () => {
     try {
-      const [cal, fw] = await Promise.all([
+      const [cal, fw, vac] = await Promise.all([
         api('/api/user/calendar?days=30', { token }),
         api('/api/friends/list', { token }),
+        api('/api/vacation/my', { token }),
       ]);
       setCalendar(cal);
       setFriends(fw);
+      setVacations(vac.requests || []);
     } catch (err) {
       if (err.code === 'UNAUTHORIZED') onLogout();
       else notify(err.message, 'error');
@@ -1207,6 +1219,70 @@ function ProfileScreen({ token, status, active, notify, onLogout }) {
       notify(err.message, 'error');
     } finally {
       setActing('');
+    }
+  };
+
+  const cancelRequest = (req) => {
+    setConfirm({
+      title: '撤回好友申请',
+      message: `确定撤回发给「${req.username}」的申请吗？`,
+      confirmText: '撤回',
+      onConfirm: async () => {
+        setConfirm(null);
+        setActing(`cancel-${req.id}`);
+        try {
+          await api('/api/friends/cancel', { method: 'POST', token, body: { userId: req.id } });
+          notify('申请已撤回');
+          await load();
+        } catch (err) {
+          notify(err.message, 'error');
+        } finally {
+          setActing('');
+        }
+      },
+    });
+  };
+
+  const removeFriend = (friend) => {
+    setConfirm({
+      title: '删除好友',
+      message: `确定删除好友「${friend.username}」吗？双方都会从好友列表中移除。`,
+      confirmText: '删除',
+      onConfirm: async () => {
+        setConfirm(null);
+        setActing(`delete-${friend.id}`);
+        try {
+          await api('/api/friends/delete', { method: 'POST', token, body: { userId: friend.id } });
+          notify('已删除好友');
+          await load();
+        } catch (err) {
+          notify(err.message, 'error');
+        } finally {
+          setActing('');
+        }
+      },
+    });
+  };
+
+  const submitVacation = async () => {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(vacStart) || !/^\d{4}-\d{2}-\d{2}$/.test(vacEnd)) {
+      notify('日期格式应为 YYYY-MM-DD', 'error');
+      return;
+    }
+    setVacBusy(true);
+    try {
+      const data = await api('/api/vacation', {
+        method: 'POST',
+        token,
+        body: { startDate: vacStart, endDate: vacEnd, reason: vacReason },
+      });
+      notify(data.message);
+      setVacReason('');
+      await load();
+    } catch (err) {
+      notify(err.message, 'error');
+    } finally {
+      setVacBusy(false);
     }
   };
 
@@ -1293,6 +1369,62 @@ function ProfileScreen({ token, status, active, notify, onLogout }) {
 
         <NeonCard style={{ marginTop: 16 }}>
           <View style={styles.rowBetween}>
+            <Text style={styles.cardTitle}>申请休假</Text>
+            <Text style={styles.cardHint}>一次最多 3 天</Text>
+          </View>
+          <Text style={styles.cardHint}>休假期间不打卡也不断签；是否自动通过由管理员开关决定。</Text>
+          <View style={[styles.inlineRow, { marginTop: 10 }]}>
+            <TextInput
+              style={[styles.input, { flex: 1 }]}
+              value={vacStart}
+              onChangeText={setVacStart}
+              placeholder="开始 YYYY-MM-DD"
+              placeholderTextColor={C.muted}
+              maxLength={10}
+            />
+            <TextInput
+              style={[styles.input, { flex: 1 }]}
+              value={vacEnd}
+              onChangeText={setVacEnd}
+              placeholder="结束 YYYY-MM-DD"
+              placeholderTextColor={C.muted}
+              maxLength={10}
+            />
+          </View>
+          <TextInput
+            style={[styles.input, { marginTop: 10 }]}
+            value={vacReason}
+            onChangeText={setVacReason}
+            placeholder="理由（选填）"
+            placeholderTextColor={C.muted}
+            maxLength={200}
+          />
+          <NeonButton
+            label="提交申请"
+            small
+            loading={vacBusy}
+            onPress={submitVacation}
+            style={{ marginTop: 12, alignSelf: 'flex-start' }}
+          />
+
+          {vacations.length > 0 ? (
+            <View style={{ marginTop: 12 }}>
+              {vacations.slice(0, 5).map((v) => (
+                <View key={v.id} style={styles.friendRow}>
+                  <Text style={styles.friendMeta}>{v.startDate} ~ {v.endDate}</Text>
+                  <View style={{ flex: 1 }} />
+                  <Tag
+                    text={v.status === 'approved' ? '已通过' : v.status === 'pending' ? '待审批' : '已拒绝'}
+                    color={v.status === 'approved' ? C.green : v.status === 'pending' ? C.yellow : C.red}
+                  />
+                </View>
+              ))}
+            </View>
+          ) : null}
+        </NeonCard>
+
+        <NeonCard style={{ marginTop: 16 }}>
+          <View style={styles.rowBetween}>
             <Text style={styles.cardTitle}>我的好友</Text>
             <Text style={styles.cardHint}>{friends ? friends.friends.length : 0} 人</Text>
           </View>
@@ -1307,6 +1439,27 @@ function ProfileScreen({ token, status, active, notify, onLogout }) {
                   </View>
                   <Text style={styles.friendName} numberOfLines={1}>{req.username}</Text>
                   <NeonButton label="同意" small loading={acting === `accept-${req.id}`} onPress={() => accept(req)} />
+                </View>
+              ))}
+            </View>
+          ) : null}
+
+          {friends && friends.outgoing && friends.outgoing.length > 0 ? (
+            <View style={{ marginTop: 10 }}>
+              <Text style={[styles.requestTitle, { color: C.muted }]}>我发出的申请</Text>
+              {friends.outgoing.map((req) => (
+                <View key={req.id} style={styles.friendRow}>
+                  <View style={styles.friendAvatar}>
+                    <Text style={styles.friendAvatarText}>{String(req.username).slice(0, 1).toUpperCase()}</Text>
+                  </View>
+                  <Text style={styles.friendName} numberOfLines={1}>{req.username}</Text>
+                  <NeonButton
+                    label="撤回"
+                    small
+                    variant="outline"
+                    loading={acting === `cancel-${req.id}`}
+                    onPress={() => cancelRequest(req)}
+                  />
                 </View>
               ))}
             </View>
@@ -1330,13 +1483,27 @@ function ProfileScreen({ token, status, active, notify, onLogout }) {
                   </View>
                   {friend.canNudge ? (
                     <NeonButton label="催一下" small loading={acting === `nudge-${friend.id}`} onPress={() => nudge(friend)} />
-                  ) : (
-                    <Tag text={STATUS_BADGE[friend.todayStatus] || '已打卡'} color={STATUS_COLOR[friend.todayStatus] || C.muted} />
-                  )}
+                  ) : null}
+                  <NeonButton
+                    label="删除"
+                    small
+                    variant="outline"
+                    loading={acting === `delete-${friend.id}`}
+                    onPress={() => removeFriend(friend)}
+                  />
                 </View>
               ))
             : null}
         </NeonCard>
+
+        <ConfirmModal
+          visible={Boolean(confirm)}
+          title={confirm ? confirm.title : ''}
+          message={confirm ? confirm.message : ''}
+          confirmText={confirm ? confirm.confirmText : '确认'}
+          onConfirm={() => confirm && confirm.onConfirm()}
+          onCancel={() => setConfirm(null)}
+        />
 
         <NeonButton label="退出登录" variant="outline" onPress={onLogout} style={{ marginTop: 24 }} />
       </ScrollView>
@@ -1382,6 +1549,10 @@ export default function App() {
   const [status, setStatus] = useState(null);
   const [tab, setTab] = useState('checkin');
   const [toast, setToast] = useState(null);
+  const [menuOpen, setMenuOpen] = useState(false);  const [pwdVisible, setPwdVisible] = useState(false);
+  const [oldPwd, setOldPwd] = useState('');
+  const [newPwd, setNewPwd] = useState('');
+  const [pwdBusy, setPwdBusy] = useState(false);
 
   const notify = useCallback((message, kind = 'info') => setToast({ message, kind, id: Date.now() }), []);
   const hideToast = useCallback(() => setToast(null), []);
@@ -1500,8 +1671,43 @@ export default function App() {
 
   if (!token || !user) return <LoginScreen onLogin={handleLogin} />;
 
+  const submitPassword = async () => {
+    if (!oldPwd || newPwd.length < 6) {
+      notify('请输入旧密码，新密码至少 6 位', 'error');
+      return;
+    }
+    setPwdBusy(true);
+    try {
+      const data = await api('/api/user/change-password', {
+        method: 'POST',
+        token,
+        body: { oldPassword: oldPwd, newPassword: newPwd },
+      });
+      if (data.token) {
+        await AsyncStorage.setItem(TOKEN_KEY, data.token);
+        setToken(data.token);
+      }
+      setPwdVisible(false);
+      setOldPwd('');
+      setNewPwd('');
+      notify('密码已修改');
+    } catch (err) {
+      notify(err.message, 'error');
+    } finally {
+      setPwdBusy(false);
+    }
+  };
+
   return (
     <View style={styles.root}>
+      {/* 顶部栏：点击头像展开菜单 */}
+      <View style={styles.topBar}>
+        <Text style={styles.topBrand}>拒绝摆烂</Text>
+        <Pressable style={styles.topAvatar} onPress={() => setMenuOpen(true)} hitSlop={8}>
+          <Text style={styles.topAvatarText}>{String(user.username || '?').slice(0, 1).toUpperCase()}</Text>
+        </Pressable>
+      </View>
+
       <View style={{ flex: 1 }}>
         {tab === 'checkin' ? (
           <CheckinScreen token={token} status={status} refresh={refreshStatus} notify={notify} onLogout={handleLogout} />
@@ -1515,6 +1721,75 @@ export default function App() {
       </View>
 
       <TabBar tab={tab} onChange={setTab} />
+
+      {/* 个人中心下拉菜单 */}
+      <Modal visible={menuOpen} transparent animationType="fade" onRequestClose={() => setMenuOpen(false)}>
+        <Pressable style={styles.menuBackdrop} onPress={() => setMenuOpen(false)}>
+          <View style={styles.menuCard}>
+            <Text style={styles.menuName} numberOfLines={1}>{user.username}</Text>
+            <Pressable
+              style={styles.menuItem}
+              onPress={() => {
+                setMenuOpen(false);
+                setTab('profile');
+              }}
+            >
+              <Text style={styles.menuText}>个人主页</Text>
+            </Pressable>
+            <Pressable
+              style={styles.menuItem}
+              onPress={() => {
+                setMenuOpen(false);
+                setPwdVisible(true);
+              }}
+            >
+              <Text style={styles.menuText}>修改密码</Text>
+            </Pressable>
+            <View style={styles.menuDivider} />
+            <Pressable
+              style={styles.menuItem}
+              onPress={() => {
+                setMenuOpen(false);
+                handleLogout();
+              }}
+            >
+              <Text style={[styles.menuText, { color: C.red }]}>退出登录</Text>
+            </Pressable>
+          </View>
+        </Pressable>
+      </Modal>
+
+      {/* 修改密码 */}
+      <Modal visible={pwdVisible} transparent animationType="fade" onRequestClose={() => setPwdVisible(false)}>
+        <View style={styles.modalBackdrop}>
+          <View style={styles.modalCard}>
+            <View style={styles.modalGlowLine} />
+            <Text style={styles.modalTitle}>修改密码</Text>
+            <Text style={styles.label}>旧密码</Text>
+            <TextInput
+              style={styles.input}
+              value={oldPwd}
+              onChangeText={setOldPwd}
+              placeholder="当前密码"
+              placeholderTextColor={C.muted}
+              secureTextEntry
+            />
+            <Text style={styles.label}>新密码</Text>
+            <TextInput
+              style={styles.input}
+              value={newPwd}
+              onChangeText={setNewPwd}
+              placeholder="至少 6 位"
+              placeholderTextColor={C.muted}
+              secureTextEntry
+            />
+            <View style={styles.modalActions}>
+              <NeonButton label="取消" variant="outline" small onPress={() => setPwdVisible(false)} style={{ flex: 1 }} />
+              <NeonButton label="确认修改" small loading={pwdBusy} onPress={submitPassword} style={{ flex: 1 }} />
+            </View>
+          </View>
+        </View>
+      </Modal>
 
       <BlockingModal
         visible={Boolean(status && status.blocked)}
@@ -1538,6 +1813,50 @@ export default function App() {
 
 const styles = StyleSheet.create({
   root: { flex: 1, backgroundColor: C.bg },
+  topBar: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: 20,
+    paddingTop: Platform.OS === 'ios' ? 6 : 10,
+    paddingBottom: 8,
+    borderBottomWidth: 1,
+    borderBottomColor: C.lineSoft,
+    backgroundColor: C.bgSoft,
+  },
+  topBrand: { color: C.text, fontSize: 15, fontWeight: '900', letterSpacing: 3, textShadowColor: C.cyan, textShadowRadius: 10 },
+  topAvatar: {
+    width: 34,
+    height: 34,
+    borderRadius: 12,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: C.cyan,
+    shadowColor: C.cyan,
+    shadowOpacity: 0.5,
+    shadowRadius: 12,
+    shadowOffset: { width: 0, height: 0 },
+    elevation: 6,
+  },
+  topAvatarText: { color: '#04070E', fontSize: 14, fontWeight: '900' },
+  menuBackdrop: { flex: 1, backgroundColor: 'rgba(4,7,14,0.55)', alignItems: 'flex-end', paddingTop: 58, paddingRight: 16 },
+  menuCard: {
+    width: 190,
+    backgroundColor: C.card,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: 'rgba(0,229,255,0.45)',
+    paddingVertical: 8,
+    shadowColor: C.cyan,
+    shadowOpacity: 0.35,
+    shadowRadius: 20,
+    shadowOffset: { width: 0, height: 0 },
+    elevation: 14,
+  },
+  menuName: { color: C.muted, fontSize: 11, fontFamily: MONO, paddingHorizontal: 16, paddingVertical: 8 },
+  menuItem: { paddingHorizontal: 16, paddingVertical: 12 },
+  menuText: { color: C.text, fontSize: 14, fontWeight: '600' },
+  menuDivider: { height: 1, backgroundColor: C.lineSoft, marginVertical: 4 },
   screen: { flex: 1, backgroundColor: C.bg },
   center: { flex: 1, alignItems: 'center', justifyContent: 'center' },
   page: { padding: 20, paddingBottom: 34 },

@@ -211,6 +211,20 @@ db.exec(`
     UNIQUE (user_id, device_id)
   );
 
+  /* 休假申请（自动/手动审批） */
+  CREATE TABLE IF NOT EXISTS vacation_requests (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    start_date  TEXT    NOT NULL,
+    end_date    TEXT    NOT NULL,
+    reason      TEXT,
+    status      TEXT    NOT NULL DEFAULT 'pending'
+                CHECK (status IN ('pending', 'approved', 'rejected')),
+    created_at  TEXT    NOT NULL,
+    reviewed_at TEXT,
+    reviewed_by INTEGER
+  );
+
   CREATE INDEX IF NOT EXISTS idx_checkins_user_date  ON checkins (user_id, date);
   CREATE INDEX IF NOT EXISTS idx_excuses_user_date   ON excuses (user_id, date);
   CREATE INDEX IF NOT EXISTS idx_friends_user        ON friends (user_id, status);
@@ -218,6 +232,8 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_nudges_to_date      ON nudges (to_user_id, date);
   CREATE INDEX IF NOT EXISTS idx_device_logins_device ON device_logins (device_id);
   CREATE INDEX IF NOT EXISTS idx_habits_user         ON habits (user_id, archived);
+  CREATE INDEX IF NOT EXISTS idx_vacation_user       ON vacation_requests (user_id, status);
+  CREATE INDEX IF NOT EXISTS idx_vacation_status     ON vacation_requests (status);
 `);
 
 /* 注意：必须在预编译语句之前完成迁移，否则旧库缺少新列会导致 prepare 失败 */
@@ -232,6 +248,13 @@ function migrate() {
   ensureColumn('users', 'leave_balance', `leave_balance INTEGER NOT NULL DEFAULT ${LEAVE_PER_MONTH}`);
   ensureColumn('users', 'leave_month', 'leave_month TEXT');
   ensureColumn('users', 'makeup_cards', 'makeup_cards INTEGER NOT NULL DEFAULT 0');
+  ensureColumn('users', 'vacation_until', 'vacation_until TEXT');
+  ensureColumn('users', 'badge_early', 'badge_early INTEGER NOT NULL DEFAULT 0');
+  ensureColumn('users', 'badge_edge', 'badge_edge INTEGER NOT NULL DEFAULT 0');
+
+  // checkins：记录“是否 08:00 前 / 是否截止前 1 小时内”，用于特殊勋章
+  ensureColumn('checkins', 'early', 'early INTEGER NOT NULL DEFAULT 0');
+  ensureColumn('checkins', 'edge', 'edge INTEGER NOT NULL DEFAULT 0');
 
   // 设备号不再做数据库级唯一约束：登录换机要能静默更新；
   // 防小号靠注册时查 device_logins / users.device_id。
@@ -363,8 +386,8 @@ const q = {
 
   checkinOn: db.prepare('SELECT * FROM checkins WHERE habit_id = ? AND date = ?'),
   insertCheckin: db.prepare(`
-    INSERT INTO checkins (habit_id, user_id, date, late, note, makeup, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO checkins (habit_id, user_id, date, late, note, makeup, early, edge, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
   `),
   deleteCheckinsOn: db.prepare('DELETE FROM checkins WHERE user_id = ? AND date = ?'),
   totalCheckins: db.prepare('SELECT COUNT(*) AS n FROM checkins WHERE user_id = ? AND makeup = 0'),
@@ -424,6 +447,53 @@ const q = {
     WHERE n.to_user_id = ? AND n.date = ?
     ORDER BY n.id DESC LIMIT 5
   `),
+
+  /* 休假 */
+  approvedVacationOn: db.prepare(`
+    SELECT * FROM vacation_requests
+    WHERE user_id = ? AND status = 'approved' AND start_date <= ? AND end_date >= ?
+    LIMIT 1
+  `),
+  myVacations: db.prepare(
+    'SELECT * FROM vacation_requests WHERE user_id = ? ORDER BY id DESC LIMIT 20'
+  ),
+  overlapVacation: db.prepare(`
+    SELECT * FROM vacation_requests
+    WHERE user_id = ? AND status IN ('pending', 'approved')
+      AND start_date <= ? AND end_date >= ?
+    LIMIT 1
+  `),
+  insertVacation: db.prepare(`
+    INSERT INTO vacation_requests (user_id, start_date, end_date, reason, status, created_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `),
+  vacationById: db.prepare('SELECT * FROM vacation_requests WHERE id = ?'),
+  updateVacation: db.prepare(`
+    UPDATE vacation_requests SET status = ?, reviewed_at = ?, reviewed_by = ? WHERE id = ?
+  `),
+  pendingVacations: db.prepare(`
+    SELECT v.*, u.username
+    FROM vacation_requests v JOIN users u ON u.id = v.user_id
+    WHERE v.status = 'pending'
+    ORDER BY v.id ASC
+    LIMIT 200
+  `),
+  recentVacations: db.prepare(`
+    SELECT v.*, u.username
+    FROM vacation_requests v JOIN users u ON u.id = v.user_id
+    WHERE v.status != 'pending'
+    ORDER BY v.id DESC
+    LIMIT 30
+  `),
+  approveAllVacations: db.prepare(`
+    UPDATE vacation_requests SET status = 'approved', reviewed_at = ?, reviewed_by = ?
+    WHERE status = 'pending'
+  `),
+  maxApprovedVacation: db.prepare(`
+    SELECT MAX(end_date) AS d FROM vacation_requests
+    WHERE user_id = ? AND status = 'approved'
+  `),
+  setVacationUntil: db.prepare('UPDATE users SET vacation_until = ?, updated_at = ? WHERE id = ?'),
 };
 
 /* --------------------------------------------------------------------------
@@ -437,8 +507,9 @@ function randomPassword() {
 function seed() {
   const defaults = {
     default_deadline: DEFAULT_DEADLINE,
-    site_name: '不拖延',
+    site_name: '拒绝摆烂（NoSlack）',
     skip_dates: '',
+    auto_approve_vacation: '1',
   };
   for (const [key, value] of Object.entries(defaults)) {
     if (!q.getSetting.get(key)) q.setSetting.run(key, value);
@@ -692,11 +763,37 @@ function consumeMakeup(user) {
   return true;
 }
 
-function badgesFor(bestStreak) {
+/** 勋章：连胜 7/30 天 + 早起鸟（连续 7 天 08:00 前）+ 极限微操（连续 7 天截止前 1 小时） */
+function badgesFor(user, bestStreak) {
   const badges = [];
   if (bestStreak >= 7) badges.push('🛡️');
   if (bestStreak >= 30) badges.push('👑');
+  if (user && user.badge_early === 1) badges.push('🐦');
+  if (user && user.badge_edge === 1) badges.push('🦉');
   return badges;
+}
+
+/** 休假判定：当天是否落在某条已通过的休假申请区间内 */
+function isVacationOn(userId, date) {
+  return Boolean(q.approvedVacationOn.get(userId, date, date));
+}
+
+/** 打卡后重新评估特殊勋章：最近 7 天每天都有 early/edge 打卡 */
+function evaluateBadges(userId, today) {
+  const from = addDays(today, -6);
+  const early = db
+    .prepare(
+      'SELECT COUNT(DISTINCT date) AS n FROM checkins WHERE user_id = ? AND early = 1 AND date BETWEEN ? AND ?'
+    )
+    .get(userId, from, today).n;
+  const edge = db
+    .prepare(
+      'SELECT COUNT(DISTINCT date) AS n FROM checkins WHERE user_id = ? AND edge = 1 AND date BETWEEN ? AND ?'
+    )
+    .get(userId, from, today).n;
+
+  if (early >= 7) db.prepare('UPDATE users SET badge_early = 1 WHERE id = ? AND badge_early = 0').run(userId);
+  if (edge >= 7) db.prepare('UPDATE users SET badge_edge = 1 WHERE id = ? AND badge_edge = 0').run(userId);
 }
 
 /* --------------------------------------------------------------------------
@@ -722,14 +819,14 @@ function settleHabit(user, habit, today) {
   let guard = 0;
 
   while (cursor <= yesterday && guard < 400) {
-    if (isActiveOn(habit, cursor) && !isSkipDate(cursor)) {
+    if (isActiveOn(habit, cursor) && !isSkipDate(cursor) && !isVacationOn(user.id, cursor)) {
       const hasCheckin = q.checkinOn.get(habit.id, cursor);
       const excuse = q.excuseOn.get(user.id, cursor);
       const protectedByLeave = Boolean(excuse && excuse.uses_leave === 1);
 
       if (!hasCheckin && !protectedByLeave) {
         if (consumeMakeup(user)) {
-          q.insertCheckin.run(habit.id, user.id, cursor, 0, '补签卡', 1, nowIso());
+          q.insertCheckin.run(habit.id, user.id, cursor, 0, '补签卡', 1, 0, 0, nowIso());
         } else {
           missed = true;
         }
@@ -810,7 +907,10 @@ function buildStatus(user, now = new Date()) {
   settleUser(user, today);
   refreshUser(user);
   ensureLeaveMonth(user);
+  evaluateBadges(user.id, today);
+  refreshUser(user);
 
+  const vacation = isVacationOn(user.id, today);
   const habits = q.habitsByUser.all(user.id);
   const items = habits.map((h) => habitState(h, user, today, now, nowMin));
   const active = items.filter((i) => i.isActiveToday);
@@ -819,7 +919,8 @@ function buildStatus(user, now = new Date()) {
   const excuseToday = q.excuseOn.get(user.id, today);
 
   let status;
-  if (holiday) status = 'holiday';
+  if (vacation) status = 'vacation';
+  else if (holiday) status = 'holiday';
   else if (excuseToday && !done.length) status = 'excused';
   else if (!active.length) status = 'rest';
   else if (done.length === active.length) status = lateAny ? 'late' : 'done';
@@ -830,6 +931,7 @@ function buildStatus(user, now = new Date()) {
   const pendingPassed = active.some((i) => !i.checkedIn && i.deadlinePassed);
   const missedYesterday =
     !isSkipDate(yesterday) &&
+    !isVacationOn(user.id, yesterday) &&
     habits.some((h) => {
       if (!isActiveOn(h, yesterday)) return false;
       if (q.checkinOn.get(h.id, yesterday)) return false;
@@ -841,7 +943,7 @@ function buildStatus(user, now = new Date()) {
   let blockDate = null;
   let blockReason = null;
 
-  if (!holiday && !excuseToday) {
+  if (!holiday && !vacation && !excuseToday) {
     if (pendingPassed) {
       blocked = true;
       blockDate = today;
@@ -872,12 +974,14 @@ function buildStatus(user, now = new Date()) {
       points: user.points,
       leaveBalance: user.leave_balance,
       makeupCards: user.makeup_cards,
-      badges: badgesFor(best),
+      badges: badgesFor(user, best),
+      vacationUntil: user.vacation_until || null,
     },
     today,
     timezone: BUSINESS_TIMEZONE,
     serverTime: now.toISOString(),
     isSkipDay: holiday,
+    isVacation: vacation,
     nextSkipDate: nextSkipDate(today),
     status,
     statusLabel: {
@@ -889,6 +993,7 @@ function buildStatus(user, now = new Date()) {
       missed: '漏签',
       holiday: '免打卡',
       rest: '今日休息',
+      vacation: '休假中',
     }[status] || status,
     streak,
     bestStreak: best,
@@ -896,7 +1001,7 @@ function buildStatus(user, now = new Date()) {
     points: user.points,
     leaveBalance: user.leave_balance,
     makeupCards: user.makeup_cards,
-    badges: badgesFor(best),
+    badges: badgesFor(user, best),
     habits: items,
     todayActiveCount: active.length,
     todayDoneCount: done.length,
@@ -913,6 +1018,7 @@ function buildStatus(user, now = new Date()) {
 
 /** 轻量版：只算今日状态（排行榜用） */
 function todayStatusOf(user, today, nowMin) {
+  if (isVacationOn(user.id, today)) return 'vacation';
   if (isSkipDate(today)) return 'holiday';
   const habits = q.habitsByUser.all(user.id);
   const active = habits.filter((h) => isActiveOn(h, today));
@@ -941,8 +1047,9 @@ function serializeUser(user) {
     points: user.points,
     leaveBalance: user.leave_balance,
     makeupCards: user.makeup_cards,
-    badges: badgesFor(best),
+    badges: badgesFor(user, best),
     deviceBound: Boolean(user.device_id),
+    vacationUntil: user.vacation_until || null,
   };
 }
 
@@ -997,7 +1104,10 @@ function buildBoard(type, me, limit) {
   const nowMin = minutesOfDay(now);
   const friendMap = me ? buildFriendMap(me.id) : null;
 
-  const rows = q.allUsers.all().map((user) => {
+  const rows = q.allUsers
+    .all()
+    .filter((user) => user.is_admin !== 1) // 管理员不上榜
+    .map((user) => {
     settleUser(user, today);
     ensureLeaveMonth(user);
     refreshUser(user);
@@ -1024,7 +1134,7 @@ function buildBoard(type, me, limit) {
       bestStreak: best,
       totalCheckins: total,
       points,
-      badges: badgesFor(best),
+      badges: badgesFor(user, best),
       todayStatus,
       friendship,
       canNudge: Boolean(
@@ -1048,18 +1158,41 @@ function buildBoard(type, me, limit) {
 
   const ranked = rows.map((row, index) => ({ rank: index + 1, ...row }));
   const meta = BOARD_TYPES[type] || BOARD_TYPES.streak;
+  const visible = ranked.slice(0, limit);
+
+  // 未登录：脱敏。只保留打卡次数与连胜天数，隐藏用户名/积分/勋章/好友信息
+  const payloadRows = me
+    ? visible
+    : visible.map((row) => ({
+        rank: row.rank,
+        userId: null,
+        username: `匿名用户${row.rank}`,
+        isAdmin: false,
+        value: type === 'points' ? null : row.value,
+        score: type === 'points' ? null : row.value,
+        streak: row.streak,
+        bestStreak: row.bestStreak,
+        totalCheckins: row.totalCheckins,
+        points: null,
+        badges: [],
+        todayStatus: row.todayStatus,
+        friendship: null,
+        canNudge: false,
+        isMe: false,
+      }));
 
   return {
     type,
     typeLabel: meta.label,
     unit: meta.unit,
     period: type,
+    anonymous: !me,
     generatedAt: now.toISOString(),
     timezone: BUSINESS_TIMEZONE,
     today,
     isSkipDay: isSkipDate(today),
     total: ranked.length,
-    rows: ranked.slice(0, limit),
+    rows: payloadRows,
     me: me ? ranked.find((r) => r.userId === me.id) || null : null,
   };
 }
@@ -1427,7 +1560,12 @@ function performCheckin(user, habit, now = new Date()) {
     return { alreadyCheckedIn: true, habit, status: null };
   }
 
-  const late = minutesOfDay(now) >= hhmmToMinutes(habit.deadline_time) ? 1 : 0;
+  const nowMin = minutesOfDay(now);
+  const deadlineMin = hhmmToMinutes(habit.deadline_time);
+  const late = nowMin >= deadlineMin ? 1 : 0;
+  // 特殊勋章判定所需的标记：08:00 前 / 截止前 1 小时内（且未迟到）
+  const early = zonedParts(now).hour < 8 ? 1 : 0;
+  const edge = !late && nowMin >= deadlineMin - 60 ? 1 : 0;
   const yesterday = addDays(today, -1);
   const continuing = habit.last_counted_date === yesterday;
   const nextStreak = continuing ? habit.current_streak + 1 : 1;
@@ -1435,11 +1573,13 @@ function performCheckin(user, habit, now = new Date()) {
   const note = null;
 
   const tx = db.transaction(() => {
-    q.insertCheckin.run(habit.id, user.id, today, late, note, 0, now.toISOString());
+    q.insertCheckin.run(habit.id, user.id, today, late, note, 0, early, edge, now.toISOString());
     q.updateHabitStreak.run(nextStreak, nextBest, today, now.toISOString(), habit.id);
     q.addPoints.run(POINTS_PER_CHECKIN, now.toISOString(), user.id);
   });
   tx();
+
+  evaluateBadges(user.id, today);
 
   habit.current_streak = nextStreak;
   habit.best_streak = nextBest;
@@ -1597,20 +1737,24 @@ app.get('/api/leaderboard', optionalAuth, (req, res) => {
   if (period === 'week' || period === 'month') {
     const today = dateKey();
     const start = period === 'week' ? startOfWeek(today) : `${today.slice(0, 7)}-01`;
-    const rows = q.allUsers.all().map((user) => {
+    const anon = !req.user;
+    const rows = q.allUsers
+      .all()
+      .filter((user) => user.is_admin !== 1)
+      .map((user) => {
       settleUser(user, today);
       const total = q.countBetween.get(user.id, start, today).n;
       return {
-        userId: user.id,
-        username: user.username,
-        isAdmin: user.is_admin === 1,
+        userId: anon ? null : user.id,
+        username: anon ? '匿名用户' : user.username,
+        isAdmin: false,
         score: total,
         value: total,
         streak: q.maxStreak.get(user.id).n,
         bestStreak: q.maxBestStreak.get(user.id).n,
         totalCheckins: q.totalCheckins.get(user.id).n,
-        points: user.points,
-        badges: badgesFor(q.maxBestStreak.get(user.id).n),
+        points: anon ? null : user.points,
+        badges: anon ? [] : badgesFor(user, q.maxBestStreak.get(user.id).n),
         todayStatus: todayStatusOf(user, today, minutesOfDay()),
         isMe: Boolean(req.user && req.user.id === user.id),
         createdAt: user.created_at,
@@ -1621,11 +1765,16 @@ app.get('/api/leaderboard', optionalAuth, (req, res) => {
       type: 'total',
       period,
       periodLabel: period === 'week' ? '本周' : '本月',
+      anonymous: anon,
       range: { start, end: today },
       timezone: BUSINESS_TIMEZONE,
       today,
       total: rows.length,
-      rows: rows.slice(0, limit).map((r, i) => ({ rank: i + 1, ...r })),
+      rows: rows.slice(0, limit).map((r, i) => ({
+        ...r,
+        rank: i + 1,
+        ...(anon ? { username: `匿名用户${i + 1}` } : {}),
+      })),
     });
   }
 
@@ -1676,7 +1825,7 @@ app.get('/api/user/calendar', authRequired, (req, res) => {
   const habits = q.habitsByUser.all(user.id);
 
   const items = [];
-  const summary = { done: 0, excused: 0, missed: 0, holiday: 0, rest: 0, pending: 0 };
+  const summary = { done: 0, excused: 0, missed: 0, holiday: 0, rest: 0, pending: 0, vacation: 0 };
 
   for (let offset = days - 1; offset >= 0; offset -= 1) {
     const date = addDays(today, -offset);
@@ -1685,7 +1834,8 @@ app.get('/api/user/calendar', authRequired, (req, res) => {
     const excuse = q.excuseOn.get(user.id, date);
 
     let status;
-    if (isSkipDate(date)) status = 'holiday';
+    if (isVacationOn(user.id, date)) status = 'vacation';
+    else if (isSkipDate(date)) status = 'holiday';
     else if (!active.length) status = 'rest';
     else if (checkins.length === active.length) status = 'done';
     else if (excuse) status = 'excused';
@@ -1731,6 +1881,8 @@ app.get('/api/settings', authRequired, (req, res) => {
     makeupCardCost: MAKEUP_CARD_COST,
     pointsPerCheckin: POINTS_PER_CHECKIN,
     pointsPerBreak: POINTS_PER_BREAK,
+    autoApproveVacation: getSetting('auto_approve_vacation', '1') === '1',
+    vacationUntil: req.user.vacation_until,
   });
 });
 
@@ -1745,6 +1897,87 @@ app.put('/api/settings', authRequired, (req, res) => {
   }
   q.updateUserDeadline.run(raw, nowIso(), req.user.id);
   res.json({ ok: true, deadline: raw, userDeadline: raw });
+});
+
+/* ------------------------------- 休假 ------------------------------------ */
+
+function vacationPublic(row) {
+  return {
+    id: row.id,
+    startDate: row.start_date,
+    endDate: row.end_date,
+    reason: row.reason || '',
+    status: row.status,
+    createdAt: row.created_at,
+    reviewedAt: row.reviewed_at || null,
+    username: row.username,
+  };
+}
+
+function syncVacationUntil(userId) {
+  const row = q.maxApprovedVacation.get(userId);
+  q.setVacationUntil.run(row ? row.d : null, nowIso(), userId);
+  return row ? row.d : null;
+}
+
+app.post('/api/vacation', authRequired, (req, res) => {
+  const user = freshUser(req.user);
+  const body = req.body || {};
+  const startDate = String(body.startDate || '');
+  const endDate = String(body.endDate || startDate);
+  const reason = typeof body.reason === 'string' ? body.reason.trim().slice(0, 200) : '';
+
+  if (!isValidDateKey(startDate) || !isValidDateKey(endDate)) {
+    return publicError(res, 400, 'INVALID_DATE', '日期格式应为 YYYY-MM-DD');
+  }
+  if (endDate < startDate) {
+    return publicError(res, 400, 'INVALID_RANGE', '结束日期不能早于开始日期');
+  }
+
+  const today = dateKey();
+  if (startDate < addDays(today, -1)) {
+    return publicError(res, 400, 'DATE_IN_PAST', '只能申请今天及以后的休假');
+  }
+
+  // 最多 3 天（含首尾）
+  const days =
+    Math.round((Date.parse(endDate) - Date.parse(startDate)) / 86400000) + 1;
+  if (days > 3) {
+    return publicError(res, 400, 'TOO_LONG', '一次最多申请 3 天');
+  }
+
+  if (q.overlapVacation.get(user.id, endDate, startDate)) {
+    return publicError(res, 409, 'OVERLAP', '该时间段已有待审批或已通过的休假');
+  }
+
+  const auto = getSetting('auto_approve_vacation', '1') === '1';
+  const status = auto ? 'approved' : 'pending';
+  const now = nowIso();
+
+  const info = q.insertVacation.run(user.id, startDate, endDate, reason || null, status, now);
+  if (auto) {
+    q.updateVacation.run('approved', now, null, info.lastInsertRowid);
+    syncVacationUntil(user.id);
+  }
+
+  const row = q.vacationById.get(info.lastInsertRowid);
+
+  console.log(`[vacation] ${user.username} ${startDate}~${endDate} -> ${status}`);
+
+  res.status(201).json({
+    ok: true,
+    autoApproved: auto,
+    message: auto ? '休假已自动通过' : '休假申请已提交，等待管理员审批',
+    request: vacationPublic(row),
+  });
+});
+
+app.get('/api/vacation/my', authRequired, (req, res) => {
+  const rows = q.myVacations.all(req.user.id).map(vacationPublic);
+  res.json({
+    autoApproveVacation: getSetting('auto_approve_vacation', '1') === '1',
+    requests: rows,
+  });
 });
 
 /* --------------------------- 账号自助修改 -------------------------------- */
@@ -1790,6 +2023,28 @@ app.put('/api/account', authRequired, (req, res) => {
   }
 
   res.json({ ok: true, token: signToken(user), user: serializeUser(user) });
+});
+
+/** 修改密码（个人中心） */
+app.post('/api/user/change-password', authRequired, (req, res) => {
+  const body = req.body || {};
+  const oldPassword = String(body.oldPassword || '');
+  const newPassword = String(body.newPassword || '');
+
+  if (!verifyPassword(oldPassword, req.user.password_hash)) {
+    return publicError(res, 403, 'BAD_OLD_PASSWORD', '旧密码不正确');
+  }
+  if (newPassword.length < 6 || newPassword.length > 72) {
+    return publicError(res, 400, 'INVALID_INPUT', '新密码长度需为 6-72 位');
+  }
+  if (newPassword === oldPassword) {
+    return publicError(res, 400, 'SAME_PASSWORD', '新密码不能与旧密码相同');
+  }
+
+  q.updatePassword.run(hashPassword(newPassword), nowIso(), req.user.id);
+  console.log(`[auth] ${req.user.username} 修改了密码`);
+
+  res.json({ ok: true, token: signToken(req.user) });
 });
 
 /* ------------------------------- 管理接口 -------------------------------- */
@@ -1850,6 +2105,9 @@ app.put('/api/admin/settings', authRequired, adminRequired, (req, res) => {
     }
     patch.skip_dates = normalized.join(',');
   }
+  if (body.autoApproveVacation !== undefined) {
+    patch.auto_approve_vacation = body.autoApproveVacation ? '1' : '0';
+  }
   if (!Object.keys(patch).length) {
     return publicError(res, 400, 'INVALID_INPUT', '没有需要修改的设置');
   }
@@ -1863,6 +2121,7 @@ app.put('/api/admin/settings', authRequired, adminRequired, (req, res) => {
     defaultDeadline: defaultDeadline(),
     skipDates: Array.from(skipDates()).sort(),
     isSkipToday: isSkipDate(dateKey()),
+    autoApproveVacation: getSetting('auto_approve_vacation', '1') === '1',
   });
 });
 
@@ -1874,6 +2133,73 @@ app.post('/api/admin/set-skip-dates', authRequired, adminRequired, (req, res) =>
   const saved = setSkipDates(normalized);
   q.audit.run(req.user.id, 'SET_SKIP_DATES', null, JSON.stringify(saved), nowIso());
   res.json({ ok: true, skipDates: saved, count: saved.length, isSkipToday: isSkipDate(dateKey()) });
+});
+
+/* ---------------------------- 管理员：休假审批 ---------------------------- */
+
+app.get('/api/admin/vacations', authRequired, adminRequired, (req, res) => {
+  res.json({
+    autoApproveVacation: getSetting('auto_approve_vacation', '1') === '1',
+    pending: q.pendingVacations.all().map(vacationPublic),
+    recent: q.recentVacations.all().map(vacationPublic),
+  });
+});
+
+function reviewVacation(req, res, status) {
+  const id = Number(req.params.id);
+  const row = Number.isInteger(id) ? q.vacationById.get(id) : null;
+  if (!row) return publicError(res, 404, 'VACATION_NOT_FOUND', '申请不存在');
+  if (row.status !== 'pending') {
+    return publicError(res, 409, 'ALREADY_REVIEWED', '该申请已处理过');
+  }
+
+  const now = nowIso();
+  q.updateVacation.run(status, now, req.user.id, row.id);
+  if (status === 'approved') syncVacationUntil(row.user_id);
+  q.audit.run(req.user.id, `VACATION_${status.toUpperCase()}`, row.user_id, String(row.id), now);
+
+  console.log(`[admin] ${req.user.username} ${status} 休假 #${row.id}`);
+
+  res.json({ ok: true, id: row.id, status, request: vacationPublic(q.vacationById.get(row.id)) });
+}
+
+app.post('/api/admin/vacations/:id/approve', authRequired, adminRequired, (req, res) =>
+  reviewVacation(req, res, 'approved')
+);
+app.post('/api/admin/vacations/:id/reject', authRequired, adminRequired, (req, res) =>
+  reviewVacation(req, res, 'rejected')
+);
+
+app.post('/api/admin/vacations/approve-all', authRequired, adminRequired, (req, res) => {
+  const pending = q.pendingVacations.all();
+  const now = nowIso();
+  const tx = db.transaction(() => {
+    q.approveAllVacations.run(now, req.user.id);
+    for (const userId of new Set(pending.map((r) => r.user_id))) syncVacationUntil(userId);
+  });
+  tx();
+  q.audit.run(req.user.id, 'VACATION_APPROVE_ALL', null, String(pending.length), now);
+  res.json({ ok: true, approved: pending.length });
+});
+
+/* ---------------------------- 管理员：删除账号 ---------------------------- */
+
+app.delete('/api/admin/user/:id', authRequired, adminRequired, (req, res) => {
+  const target = q.userById.get(Number(req.params.id));
+  if (!target) return publicError(res, 404, 'USER_NOT_FOUND', '用户不存在');
+  if (target.id === req.user.id) {
+    return publicError(res, 400, 'CANNOT_DELETE_SELF', '不能删除自己的账号');
+  }
+  if (target.is_admin === 1) {
+    return publicError(res, 400, 'CANNOT_DELETE_ADMIN', '不能删除管理员账号');
+  }
+
+  const username = target.username;
+  db.prepare('DELETE FROM users WHERE id = ?').run(target.id);
+  q.audit.run(req.user.id, 'DELETE_USER', target.id, username, nowIso());
+
+  console.log(`[admin] ${req.user.username} 删除了账号 ${username}(#${target.id})`);
+  res.json({ ok: true, deleted: username });
 });
 
 function normalizeSkipDates(input) {
@@ -1959,6 +2285,42 @@ app.post('/api/friends/accept', authRequired, (req, res) => {
   tx();
 
   res.json({ ok: true, friend: { id: requester.id, username: requester.username }, state: 'accepted' });
+});
+
+/** 撤回自己发出的好友申请 */
+app.post('/api/friends/cancel', authRequired, (req, res) => {
+  const me = req.user;
+  const target = resolveBodyUser(req.body);
+  if (!target) return publicError(res, 404, 'USER_NOT_FOUND', '对方不存在');
+
+  const pending = q.friendshipOne.get(me.id, target.id);
+  if (!pending || pending.status !== 'pending') {
+    return publicError(res, 404, 'NO_PENDING_REQUEST', '没有可撤回的申请');
+  }
+
+  db.prepare('DELETE FROM friends WHERE id = ?').run(pending.id);
+  console.log(`[friend] ${me.username} 撤回了好友申请 -> ${target.username}`);
+  res.json({ ok: true, status: 'canceled' });
+});
+
+/** 双向删除好友 */
+app.post('/api/friends/delete', authRequired, (req, res) => {
+  const me = req.user;
+  const target = resolveBodyUser(req.body);
+  if (!target) return publicError(res, 404, 'USER_NOT_FOUND', '对方不存在');
+
+  const info = db
+    .prepare(
+      'DELETE FROM friends WHERE (user_id = ? AND friend_id = ?) OR (user_id = ? AND friend_id = ?)'
+    )
+    .run(me.id, target.id, target.id, me.id);
+
+  if (!info.changes) {
+    return publicError(res, 404, 'NOT_FRIENDS', '你们还不是好友');
+  }
+
+  console.log(`[friend] ${me.username} 删除了好友 ${target.username}`);
+  res.json({ ok: true, status: 'deleted', removed: info.changes });
 });
 
 app.get('/api/friends/list', authRequired, (req, res) => {

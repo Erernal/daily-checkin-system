@@ -4,7 +4,7 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
 <meta name="theme-color" content="#0A0E17" />
-<title>不拖延 · 强制打卡系统</title>
+<title>拒绝摆烂（NoSlack）· 强制打卡系统</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⏰</text></svg>" />
 <style>
   :root {
@@ -174,6 +174,17 @@
   .week-chip { width: 42px; height: 42px; border-radius: 10px; border: 1px solid var(--line-soft); background: rgba(255,255,255,.03); color: var(--muted); font-weight: 700; }
   .week-chip.active { border-color: var(--cyan); color: var(--cyan); background: rgba(0,229,255,.16); box-shadow: 0 0 14px rgba(0,229,255,.35); }
 
+  /* 休假审批开关 */
+  .switch { position: relative; display: inline-block; width: 46px; height: 26px; }
+  .switch input { opacity: 0; width: 0; height: 0; }
+  .slider { position: absolute; inset: 0; background: #2A2F3A; border-radius: 999px; transition: .2s; border: 1px solid var(--line-soft); }
+  .slider::before { content: ''; position: absolute; width: 18px; height: 18px; left: 3px; top: 3px; background: #8A8A8A; border-radius: 50%; transition: .2s; }
+  .switch input:checked + .slider { background: rgba(0,229,255,.25); border-color: var(--cyan); box-shadow: 0 0 14px rgba(0,229,255,.35); }
+  .switch input:checked + .slider::before { transform: translateX(20px); background: var(--cyan); }
+  .vac-row { display: flex; align-items: center; gap: 10px; padding: 10px 0; border-bottom: 1px solid var(--line-soft); }
+  .vac-row:last-child { border-bottom: 0; }
+  .vac-dates { font-family: var(--mono); font-size: 12px; color: var(--text); }
+
   #toast { position: fixed; left: 50%; bottom: 32px; transform: translate(-50%, 20px); background: rgba(18,22,31,.96); border: 1px solid rgba(0,229,255,.5); padding: 13px 22px; border-radius: 12px; font-size: 13px; box-shadow: 0 0 26px rgba(0,229,255,.28); opacity: 0; pointer-events: none; transition: opacity .2s, transform .2s; z-index: 100; max-width: min(92vw, 480px); }
   #toast.show { opacity: 1; transform: translate(-50%, 0); }
   #toast.err { border-color: rgba(255,92,122,.6); }
@@ -194,8 +205,8 @@
     <div class="auth-brand">
       <span class="logo">⏰</span>
       <div>
-        <h1>不拖延</h1>
-        <p>CHECK-IN OR EXCUSE · 多习惯强制打卡</p>
+        <h1>拒绝摆烂</h1>
+        <p>NOSLACK · 多习惯强制打卡</p>
       </div>
     </div>
 
@@ -247,7 +258,7 @@
   <header class="topbar">
     <div class="brand">
       <span class="logo">⏰</span>
-      <div><strong>不拖延</strong><small>NEVER PUT OFF</small></div>
+      <div><strong>拒绝摆烂</strong><small>NOSLACK</small></div>
     </div>
     <div class="userbox">
       <span class="chip" id="user-chip">—</span>
@@ -319,6 +330,22 @@
     <section id="view-settings" class="hidden">
       <div class="settings">
         <div class="card">
+          <h2>申请休假 <span class="tag" id="vacation-mode">自动通过</span></h2>
+          <p class="hint">一次最多 3 天；休假期间不打卡也不断签。</p>
+          <div class="row">
+            <div><label for="vac-start">开始日期</label><input id="vac-start" type="date" /></div>
+            <div><label for="vac-end">结束日期</label><input id="vac-end" type="date" /></div>
+          </div>
+          <label for="vac-reason">理由（选填）</label>
+          <input id="vac-reason" type="text" maxlength="200" placeholder="例如：出差 / 生病" />
+          <div class="save-row">
+            <button class="primary" id="vac-submit" type="button">提交申请</button>
+            <span class="inline-hint" id="vac-hint"></span>
+          </div>
+          <div id="vac-list"></div>
+        </div>
+
+        <div class="card">
           <h2>我的好友 <span class="tag" id="friend-count">0 人</span></h2>
           <p class="hint">排行榜里未打卡的用户会出现「加好友 / 催一下」按钮。</p>
           <div id="incoming-list"></div>
@@ -358,6 +385,22 @@
               <span class="inline-hint" id="admin-skip-hint"></span>
             </div>
           </form>
+        </div>
+
+        <div class="card admin-only hidden">
+          <h2>休假审批 <span class="tag purple">ADMIN</span></h2>
+          <div class="save-row" style="justify-content:space-between;margin-top:0">
+            <span class="hint" style="margin:0">自动同意请假</span>
+            <label class="switch">
+              <input type="checkbox" id="auto-vacation" />
+              <span class="slider"></span>
+            </label>
+          </div>
+          <p class="hint" id="vac-admin-hint">开启后用户提交休假直接通过，无需审批。</p>
+          <div class="save-row">
+            <button class="primary" id="vac-approve-all" type="button">一键同意全部</button>
+          </div>
+          <div id="vac-pending"><p class="inline-hint">加载中…</p></div>
         </div>
       </div>
     </section>
@@ -519,7 +562,7 @@
     });
     if (view === 'dashboard') loadStatus();
     if (view === 'board') loadBoard();
-    if (view === 'settings') { loadSettings(); loadFriends(); }
+    if (view === 'settings') { loadSettings(); loadFriends(); loadVacations(); if (state.user.isAdmin) loadAdminVacations(); }
   }
   document.querySelectorAll('.nav button').forEach(function (btn) {
     btn.onclick = function () { switchView(btn.getAttribute('data-view')); };
@@ -695,7 +738,10 @@
     var medal = row.rank === 1 ? '🥇' : row.rank === 2 ? '🥈' : row.rank === 3 ? '🥉' : row.rank;
     var badges = (row.badges || []).join(' ');
     var adminCol = state.user && state.user.isAdmin
-      ? '<td class="admin-col"><button class="danger-link" data-reset="' + row.userId + '" data-name="' + esc(row.username) + '" type="button">重置</button></td>'
+      ? '<td class="admin-col">' +
+          '<button class="danger-link" data-reset="' + row.userId + '" data-name="' + esc(row.username) + '" type="button">重置</button> ' +
+          '<button class="danger-link" data-del="' + row.userId + '" data-name="' + esc(row.username) + '" type="button" style="margin-left:6px">删号</button>' +
+        '</td>'
       : '<td class="admin-col hidden"></td>';
     return (
       '<tr class="' + (row.isMe ? 'me' : '') + '">' +
@@ -730,13 +776,27 @@
     document.querySelectorAll('#board-body [data-reset]').forEach(function (btn) {
       btn.onclick = function () { resetUser(btn.getAttribute('data-reset'), btn.getAttribute('data-name')); };
     });
+    document.querySelectorAll('#board-body [data-del]').forEach(function (btn) {
+      btn.onclick = function () { deleteUser(btn.getAttribute('data-del'), btn.getAttribute('data-name')); };
+    });
+  }
+
+  function deleteUser(userId, username) {
+    if (!confirm('确定删除账号「' + username + '」吗？该用户的习惯、打卡、好友、休假记录都会被清空，且不可恢复。')) return;
+    api('/api/admin/user/' + userId, { method: 'DELETE' })
+      .then(function () { toast('已删除账号 ' + username); loadBoard(); })
+      .catch(function (err) { toast(err.message, true); });
   }
 
   function friendAction(kind, userId, username, btn) {
+    if (kind === 'cancel' && !confirm('确定撤回发给「' + username + '」的好友申请吗？')) return;
+    if (kind === 'delete' && !confirm('确定删除好友「' + username + '」吗？')) return;
     btn.disabled = true;
     var req;
     if (kind === 'add') req = api('/api/friends/request', { method: 'POST', body: { userId: userId } }).then(function () { toast('已向 ' + username + ' 发送申请'); });
     else if (kind === 'accept') req = api('/api/friends/accept', { method: 'POST', body: { userId: userId } }).then(function () { toast('已添加 ' + username); });
+    else if (kind === 'cancel') req = api('/api/friends/cancel', { method: 'POST', body: { userId: userId } }).then(function () { toast('已撤回申请'); });
+    else if (kind === 'delete') req = api('/api/friends/delete', { method: 'POST', body: { userId: userId } }).then(function () { toast('已删除好友 ' + username); });
     else req = api('/api/nudge/' + encodeURIComponent(username), { method: 'POST' }).then(function () { toast('已催 ' + username); });
     req.then(function () { loadBoard(); loadFriends(); }).catch(function (err) { toast(err.message, true); btn.disabled = false; });
   }
@@ -775,9 +835,26 @@
               : '<span class="badge ' + esc(f.todayStatus) + '">' + esc(STATUS_BADGE[f.todayStatus] || f.todayStatus) + '</span>';
             return '<div class="friend-item"><div class="avatar">' + esc(f.username.slice(0, 1).toUpperCase()) + '</div>' +
               '<div class="friend-main"><div class="friend-name">' + esc(f.username) + '</div>' +
-              '<div class="friend-sub">连 ' + f.streak + ' 天 · 最佳 ' + f.bestStreak + ' 天</div></div>' + action + '</div>';
+              '<div class="friend-sub">连 ' + f.streak + ' 天 · 最佳 ' + f.bestStreak + ' 天</div></div>' + action +
+              '<button class="mini outline" data-friend="delete" data-id="' + f.id + '" data-name="' + esc(f.username) + '" type="button" style="margin-left:6px">删除</button></div>';
           }).join('')
         : '<p class="inline-hint">还没有好友，去排行榜加几个。</p>';
+
+      $('incoming-list').innerHTML =
+        (data.incoming.length
+          ? '<div class="request-title">待处理申请</div>' + data.incoming.map(function (req) {
+              return '<div class="friend-item"><div class="avatar">' + esc(req.username.slice(0, 1).toUpperCase()) + '</div>' +
+                '<div class="friend-main"><div class="friend-name">' + esc(req.username) + '</div><div class="friend-sub">请求加你为好友</div></div>' +
+                '<button class="mini purple" data-friend="accept" data-id="' + req.id + '" data-name="' + esc(req.username) + '" type="button">同意</button></div>';
+            }).join('')
+          : '') +
+        (data.outgoing && data.outgoing.length
+          ? '<div class="request-title" style="color:var(--muted)">我发出的申请</div>' + data.outgoing.map(function (req) {
+              return '<div class="friend-item"><div class="avatar">' + esc(req.username.slice(0, 1).toUpperCase()) + '</div>' +
+                '<div class="friend-main"><div class="friend-name">' + esc(req.username) + '</div><div class="friend-sub">等待对方同意</div></div>' +
+                '<button class="mini outline" data-friend="cancel" data-id="' + req.id + '" data-name="' + esc(req.username) + '" type="button">撤回</button></div>';
+            }).join('')
+          : '');
 
       document.querySelectorAll('#view-settings [data-friend]').forEach(function (btn) {
         btn.onclick = function () { friendAction(btn.getAttribute('data-friend'), Number(btn.getAttribute('data-id')), btn.getAttribute('data-name'), btn); };
@@ -832,6 +909,96 @@
       .catch(function (err) { toast(err.message, true); });
   };
 
+  /* ---------------- 休假（用户） ---------------- */
+  function todayStr() {
+    var d = new Date();
+    var p = function (n) { return String(n).padStart(2, '0'); };
+    return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate());
+  }
+
+  function loadVacations() {
+    if (!state.user) return;
+    api('/api/vacation/my').then(function (data) {
+      $('vacation-mode').textContent = data.autoApproveVacation ? '自动通过' : '需管理员审批';
+      $('vacation-mode').style.color = data.autoApproveVacation ? 'var(--cyan)' : 'var(--yellow)';
+      if (!$('vac-start').value) $('vac-start').value = todayStr();
+      if (!$('vac-end').value) $('vac-end').value = todayStr();
+      $('vac-list').innerHTML = data.requests.length
+        ? data.requests.slice(0, 6).map(function (v) {
+            var color = v.status === 'approved' ? 'var(--green)' : v.status === 'pending' ? 'var(--yellow)' : 'var(--red)';
+            var label = v.status === 'approved' ? '已通过' : v.status === 'pending' ? '待审批' : '已拒绝';
+            return '<div class="vac-row"><span class="vac-dates">' + esc(v.startDate) + ' ~ ' + esc(v.endDate) + '</span>' +
+              '<span style="flex:1"></span><span class="badge" style="color:' + color + ';border-color:' + color + '">' + label + '</span></div>';
+          }).join('')
+        : '';
+    }).catch(function (err) { if (err.code !== 'UNAUTHORIZED') toast(err.message, true); });
+  }
+
+  $('vac-submit').onclick = function () {
+    var startDate = $('vac-start').value;
+    var endDate = $('vac-end').value || startDate;
+    api('/api/vacation', { method: 'POST', body: { startDate: startDate, endDate: endDate, reason: $('vac-reason').value } })
+      .then(function (data) {
+        toast(data.message);
+        $('vac-reason').value = '';
+        loadVacations();
+        loadStatus();
+      })
+      .catch(function (err) { toast(err.message, true); });
+  };
+
+  /* ---------------- 休假（管理员） ---------------- */
+  function loadAdminVacations() {
+    if (!state.user || !state.user.isAdmin) return;
+    api('/api/admin/vacations').then(function (data) {
+      $('auto-vacation').checked = Boolean(data.autoApproveVacation);
+      $('vac-admin-hint').textContent = data.autoApproveVacation
+        ? '当前：自动同意，新申请直接通过。'
+        : '当前：手动审批，共 ' + data.pending.length + ' 条待处理。';
+      $('vac-pending').innerHTML = data.pending.length
+        ? data.pending.map(function (v) {
+            return '<div class="vac-row"><span class="vac-dates">' + esc(v.username) + ' · ' + esc(v.startDate) + ' ~ ' + esc(v.endDate) + '</span>' +
+              '<span class="inline-hint" style="flex:1;margin-left:8px">' + esc(v.reason || '') + '</span>' +
+              '<button class="mini solid" data-vac="approve" data-id="' + v.id + '" type="button">同意</button>' +
+              '<button class="mini outline" data-vac="reject" data-id="' + v.id + '" type="button" style="margin-left:6px">拒绝</button></div>';
+          }).join('')
+        : '<p class="inline-hint">暂无待审批申请</p>';
+
+      document.querySelectorAll('#vac-pending [data-vac]').forEach(function (btn) {
+        btn.onclick = function () {
+          var action = btn.getAttribute('data-vac');
+          var id = btn.getAttribute('data-id');
+          if (action === 'reject' && !confirm('确定拒绝这条休假申请吗？')) return;
+          btn.disabled = true;
+          api('/api/admin/vacations/' + id + '/' + action, { method: 'POST' })
+            .then(function () { toast(action === 'approve' ? '已同意' : '已拒绝'); loadAdminVacations(); })
+            .catch(function (err) { toast(err.message, true); btn.disabled = false; });
+        };
+      });
+    }).catch(function (err) { toast(err.message, true); });
+  }
+
+  $('auto-vacation').onchange = function () {
+    var value = $('auto-vacation').checked;
+    api('/api/admin/settings', { method: 'PUT', body: { autoApproveVacation: value } })
+      .then(function () {
+        toast(value ? '已开启自动同意请假' : '已关闭自动同意，改为手动审批');
+        loadAdminVacations();
+        loadVacations();
+      })
+      .catch(function (err) {
+        toast(err.message, true);
+        $('auto-vacation').checked = !value;
+      });
+  };
+
+  $('vac-approve-all').onclick = function () {
+    if (!confirm('确定同意所有待审批的休假申请吗？')) return;
+    api('/api/admin/vacations/approve-all', { method: 'POST' })
+      .then(function (data) { toast('已同意 ' + data.approved + ' 条申请'); loadAdminVacations(); })
+      .catch(function (err) { toast(err.message, true); });
+  };
+
   /* ---------------- 游客排行榜 ---------------- */
   function openGuest() {
     $('auth-view').classList.add('hidden');
@@ -851,13 +1018,17 @@
       .then(function (data) {
         var meta = BOARD_META[data.type] || BOARD_META.streak;
         $('guest-score-head').textContent = meta.label.replace('榜', '');
-        $('guest-meta').textContent = meta.label + ' · 共 ' + data.total + ' 人 · ' + data.timezone + (data.isSkipDay ? ' · 免打卡日' : '');
+        $('guest-meta').textContent =
+          meta.label + ' · 共 ' + data.total + ' 人 · ' + data.timezone +
+          (data.anonymous ? ' · 匿名浏览：仅显示连胜与打卡次数' : '') +
+          (data.isSkipDay ? ' · 免打卡日' : '');
         $('guest-body').innerHTML = data.rows.length
           ? data.rows.map(function (row) {
               var medal = row.rank === 1 ? '🥇' : row.rank === 2 ? '🥈' : row.rank === 3 ? '🥉' : row.rank;
+              var value = row.value == null ? '—' : row.value + ' ' + data.unit;
               return '<tr><td><span class="rank">' + medal + '</span></td>' +
                 '<td><div class="who"><span class="avatar">' + esc(row.username.slice(0, 1).toUpperCase()) + '</span>' + esc(row.username) + ' ' + (row.badges || []).join(' ') + '</div></td>' +
-                '<td><span class="num big">' + row.value + '</span> ' + data.unit + '</td>' +
+                '<td><span class="num big">' + value + '</span></td>' +
                 '<td><span class="badge ' + esc(row.todayStatus) + '">' + esc(STATUS_BADGE[row.todayStatus] || row.todayStatus) + '</span></td></tr>';
             }).join('')
           : '<tr><td colspan="4" class="empty">还没有人上榜</td></tr>';

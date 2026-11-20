@@ -1,6 +1,6 @@
-# 不拖延 · 强制打卡系统 v3
+# 拒绝摆烂（NoSlack）· 强制打卡系统 v4
 
-Web 管理端 + 移动 App + 统一后端。**多习惯**打卡：每个习惯可以单独设置生效星期与截止时间，休息日不打卡也不断签；打卡攒积分，断签扣分，积分能换补签卡；排行榜分「连胜 / 总次数 / 积分」三榜。
+Web 管理端 + 移动 App + 统一后端。**多习惯**打卡：每个习惯单独设置生效星期与截止时间，休息日不打卡也不断签；打卡攒积分、断签扣分、积分换补签卡；排行榜分「连胜 / 总次数 / 积分」三榜，未登录只能看脱敏数据。
 
 | 部分 | 技术栈 | 入口 |
 | --- | --- | --- |
@@ -10,7 +10,7 @@ Web 管理端 + 移动 App + 统一后端。**多习惯**打卡：每个习惯�
 
 所有日期与截止判断**强制北京时间（Asia/Shanghai）**，与服务器/手机时区无关。
 
-## v3 模块对照
+## v4 模块对照
 
 | 模块 | 落地位置 |
 | --- | --- |
@@ -27,13 +27,14 @@ Web 管理端 + 移动 App + 统一后端。**多习惯**打卡：每个习惯�
 ```
 work2/
 ├── server/
-│   ├── server.js                      # ★ v3 后端
+│   ├── server.js                      # ★ v4 后端
 │   ├── public/index.html              # ★ Web 端
 │   ├── migrations/
 │   │   ├── 002_v2_friends_skipdates.sql
-│   │   └── 003_v3_habits.sql          # ★ v2 → v3 变更
+│   │   ├── 003_v3_habits.sql
+│   │   └── 004_v4_vacation.sql        # ★ v3 → v4 变更
 │   ├── scripts/{seed-demo,reset-password}.mjs
-│   ├── test/{smoke,v2,v3}.mjs         # 44 + 52 + 48 条
+│   ├── test/{smoke,v2,v3,v4}.mjs      # 44 + 52 + 46 + 46 条
 │   └── data/                          # SQLite（运行时生成）
 ├── app/{App.js,index.js,app.json}     # ★ Expo App
 └── deploy/{ecosystem.config.js,nginx.conf.example}
@@ -77,7 +78,8 @@ cd server
 npm start
 npm run smoke     # 44 条：基础接口
 npm run test:v2   # 52 条：好友 / 免打卡日 / 周期榜
-npm run test:v3   # 48 条：习惯 / 休息日 / 积分 / 请假 / 补签 / 设备
+npm run test:v3   # 46 条：习惯 / 休息日 / 积分 / 请假 / 补签 / 设备
+npm run test:v4   # 46 条：隐私榜单 / 好友撤回删除 / 休假审批 / 改密码 / 勋章 / 删号
 ```
 
 > 注册接口有「同 IP 20 次/小时」限流，反复跑测试前重启一次服务即可重置。
@@ -97,8 +99,12 @@ npm run test:v3   # 48 条：习惯 / 休息日 / 积分 / 请假 / 补签 / 设
 | 连胜 | 取该用户所有习惯中的最大连胜；枚举报：最佳 ≥7 天 🛡️，≥30 天 👑 |
 | 免打卡日 | 管理员设置的全员日期，不打卡不断签、不触发阻断 |
 | 设备 | 注册时同一设备只能开一个号（查 `device_logins` / `users.device_id`，409）；**登录不拦截**，换机登录会静默把 `users.device_id` 更新为新设备并记录到 `device_logins` |
+| 休假 | 每人最多 3 天/次；`auto_approve_vacation=1` 时自动通过并写入 `vacation_until`，=0 时进入待审批；已通过的日期结算时跳过、不触发阻断 |
+| 隐私榜单 | 未登录访问榜单返回「匿名用户N」，隐藏 userId / 积分 / 勋章 / 好友信息，只保留连胜与打卡次数 |
+| 管理员隔离 | 所有榜单过滤 `is_admin = 0`，管理员不上榜 |
+| 勋章扩展 | 连续 7 天 08:00 前打卡 🐦；连续 7 天在截止前 1 小时内打卡 🦉（与 🛡️👑 叠加显示） |
 
-**强制阻断**（App 全屏遮罩）：今天有生效习惯已过截止仍未完成 / 昨天有生效习惯漏签，且未请假。
+**强制阻断**（App 全屏遮罩）：今天有生效习惯已过截止仍未完成 / 昨天有生效习惯漏签，且未请假、未休假。
 
 ---
 
@@ -145,9 +151,18 @@ npm run test:v3   # 48 条：习惯 / 休息日 / 积分 / 请假 / 补签 / 设
 | POST | `/api/excuse` | 请假/借口，消耗额度时保连胜 |
 | POST | `/api/shop/makeup-card` | `{quantity}`，100 分/张 |
 | GET | `/api/user/calendar?days=30` | 热力图（done/excused/missed/rest/holiday/pending） |
-| GET/PUT | `/api/settings` | 个人截止时间、免打卡日、积分规则 |
+| GET/PUT | `/api/settings` | 个人截止时间、免打卡日、积分规则、休假开关 |
 | PUT | `/api/account` | 改用户名/密码 |
-| — | 好友 / 催打卡 / 管理接口 | 同 v2，未变 |
+| POST | `/api/user/change-password` | `{oldPassword, newPassword}`，返回新 token |
+| POST | `/api/friends/cancel` | 撤回自己发出的申请 |
+| POST | `/api/friends/delete` | 双向删除好友 |
+| POST | `/api/vacation` | `{startDate, endDate, reason?}`，最多 3 天；自动/手动由开关决定 |
+| GET | `/api/vacation/my` | 我的休假申请 |
+| GET | `/api/admin/vacations` | 待审批 + 最近处理记录 |
+| POST | `/api/admin/vacations/:id/approve\|reject` | 审批单条 |
+| POST | `/api/admin/vacations/approve-all` | 一键同意全部 |
+| DELETE | `/api/admin/user/:id` | 删除用户并级联清空数据 |
+| — | 好友 / 催打卡 / 管理接口 | 同 v2 |
 
 ---
 
@@ -171,9 +186,9 @@ npm run test:v3   # 48 条：习惯 / 休息日 / 积分 / 请假 / 补签 / 设
 
 ---
 
-## 六、数据库变更（v2 → v3）
+## 六、数据库变更（v2 → v3 → v4）
 
-完整 SQL 见 [`server/migrations/003_v3_habits.sql`](server/migrations/003_v3_habits.sql)，服务启动时会自动做同样的幂等迁移。
+完整 SQL 见 [`server/migrations/003_v3_habits.sql`](server/migrations/003_v3_habits.sql) 与 [`004_v4_vacation.sql`](server/migrations/004_v4_vacation.sql)，服务启动时会自动做同样的幂等迁移。
 
 ```sql
 ALTER TABLE users ADD COLUMN device_id TEXT;

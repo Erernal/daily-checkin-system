@@ -1,8 +1,8 @@
 {
   "name": "qiangzhi-checkin-server",
-  "version": "3.0.0",
+  "version": "4.0.0",
   "private": true,
-  "description": "防拖延强制打卡系统 v3 - 多习惯/休息日/积分/三榜",
+  "description": "拒绝摆烂 NoSlack - 多习惯/休假审批/隐私榜单",
   "main": "server.js",
   "engines": {
     "node": ">=18.17"
@@ -13,7 +13,8 @@
     "smoke": "node test/smoke.mjs",
     "seed:demo": "node scripts/seed-demo.mjs",
     "test:v2": "node test/v2.mjs",
-    "test:v3": "node test/v3.mjs"
+    "test:v3": "node test/v3.mjs",
+    "test:v4": "node test/v4.mjs"
   },
   "pnpm": {
     "onlyBuiltDependencies": [

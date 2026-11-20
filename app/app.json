@@ -1,10 +1,10 @@
 {
   "expo": {
-    "name": "不拖延",
-    "slug": "qiangzhi-checkin",
+    "name": "拒绝摆烂（NoSlack）",
+    "slug": "noslack",
     "version": "1.0.0",
     "orientation": "portrait",
-    "scheme": "qiangzhi",
+    "scheme": "noslack",
     "userInterfaceStyle": "dark",
     "newArchEnabled": true,
     "ios": {
